@@ -1,0 +1,7 @@
+model,device,prompt_tokens,generated_tokens,use_cache,total_time_seconds,tokens_per_second,peak_memory_mb
+distilgpt2,cpu,23,30,True,1.1215,26.7493,0
+distilgpt2,cpu,23,30,False,1.203,24.9377,0
+distilgpt2,cpu,115,30,True,0.6536,45.9001,0
+distilgpt2,cpu,115,30,False,1.79,16.7599,0
+distilgpt2,cpu,230,30,True,0.6781,44.2415,0
+distilgpt2,cpu,230,30,False,2.5098,11.953,0
