@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 export default function Home() {
   const [player, setPlayer] = useState({ x: 110, y: 330 });
@@ -12,6 +12,8 @@ export default function Home() {
   const [cacheMode, setCacheMode] = useState("KV Cache ON");
   const [loading, setLoading] = useState(false);
 
+  const gameRef = useRef<HTMLDivElement | null>(null);
+
   const npc = { x: 690, y: 300 };
   const speed = 18;
 
@@ -21,38 +23,77 @@ export default function Home() {
 
   const isNearNpc = distance < 130;
 
+  function movePlayer(key: string) {
+    const lowerKey = key.toLowerCase();
+
+    setPlayer((prev) => {
+      let nextX = prev.x;
+      let nextY = prev.y;
+
+      if (key === "ArrowUp" || lowerKey === "w") nextY -= speed;
+      if (key === "ArrowDown" || lowerKey === "s") nextY += speed;
+      if (key === "ArrowLeft" || lowerKey === "a") nextX -= speed;
+      if (key === "ArrowRight" || lowerKey === "d") nextX += speed;
+
+      nextX = Math.max(30, Math.min(900, nextX));
+      nextY = Math.max(90, Math.min(450, nextY));
+
+      return { x: nextX, y: nextY };
+    });
+  }
+
   useEffect(() => {
+    gameRef.current?.focus();
+
     function handleKeyDown(event: KeyboardEvent) {
-      setPlayer((prev) => {
-        let nextX = prev.x;
-        let nextY = prev.y;
+      const target = event.target as HTMLElement;
 
-        if (event.key === "ArrowUp" || event.key.toLowerCase() === "w") nextY -= speed;
-        if (event.key === "ArrowDown" || event.key.toLowerCase() === "s") nextY += speed;
-        if (event.key === "ArrowLeft" || event.key.toLowerCase() === "a") nextX -= speed;
-        if (event.key === "ArrowRight" || event.key.toLowerCase() === "d") nextX += speed;
+      if (
+        target.tagName === "INPUT" ||
+        target.tagName === "TEXTAREA" ||
+        target.tagName === "SELECT"
+      ) {
+        return;
+      }
 
-        nextX = Math.max(30, Math.min(900, nextX));
-        nextY = Math.max(90, Math.min(450, nextY));
+      const validKeys = [
+        "ArrowUp",
+        "ArrowDown",
+        "ArrowLeft",
+        "ArrowRight",
+        "w",
+        "a",
+        "s",
+        "d",
+        "W",
+        "A",
+        "S",
+        "D",
+      ];
 
-        return { x: nextX, y: nextY };
-      });
+      if (!validKeys.includes(event.key)) return;
+
+      event.preventDefault();
+      movePlayer(event.key);
     }
 
     window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
+
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
   }, []);
 
-
   async function handleSend() {
-  if (!message.trim() || !isNearNpc) return;
+    if (!message.trim() || !isNearNpc) return;
 
-  setLoading(true);
+    setLoading(true);
 
-  try {
-    const response = await fetch(
-      "http://localhost:8000/chat",
-      {
+    try {
+      const backendUrl =
+        process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+
+      const response = await fetch(`${backendUrl}/chat`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -61,22 +102,20 @@ export default function Home() {
           message,
           use_cache: cacheMode === "KV Cache ON",
         }),
-      }
-    );
+      });
 
-    const data = await response.json();
+      const data = await response.json();
 
-    setNpcResponse(data.response);
-    setLatency(data.latency_ms);
-  } catch (error) {
-    setNpcResponse(
-      "Could not connect to backend."
-    );
+      setNpcResponse(data.response);
+      setLatency(data.latency_ms);
+    } catch (error) {
+      setNpcResponse("Could not connect to backend.");
+    }
+
+    setMessage("");
+    setLoading(false);
+    gameRef.current?.focus();
   }
-
-  setMessage("");
-  setLoading(false);
-}
 
   return (
     <main className="min-h-screen bg-gradient-to-b from-sky-300 via-cyan-100 to-lime-100 p-8 text-slate-900">
@@ -85,35 +124,59 @@ export default function Home() {
           <p className="text-sm font-bold uppercase tracking-[0.25em] text-purple-600">
             Week 4 Prototype
           </p>
+
           <h1 className="text-5xl font-black text-blue-700">
             CacheQuest: AI NPC Demo
           </h1>
+
           <p className="mt-2 text-lg font-medium text-slate-700">
-            Move around the cartoon world, talk to the AI Elder, and compare fast vs slow responses.
+            Move around the cartoon world, talk to the AI Elder, and compare
+            fast vs slow responses.
           </p>
         </div>
 
         <section className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_330px]">
           <div className="rounded-3xl border-4 border-white bg-white/80 p-5 shadow-2xl">
             <div
-              className="relative h-[560px] overflow-hidden rounded-3xl border-4 border-green-500 bg-green-300"
+              ref={gameRef}
+              tabIndex={0}
+              onClick={() => gameRef.current?.focus()}
+              onKeyDown={(event) => {
+                const validKeys = [
+                  "ArrowUp",
+                  "ArrowDown",
+                  "ArrowLeft",
+                  "ArrowRight",
+                  "w",
+                  "a",
+                  "s",
+                  "d",
+                  "W",
+                  "A",
+                  "S",
+                  "D",
+                ];
+
+                if (!validKeys.includes(event.key)) return;
+
+                event.preventDefault();
+                movePlayer(event.key);
+              }}
+              className="relative h-[560px] overflow-hidden rounded-3xl border-4 border-green-500 bg-green-300 outline-none"
               style={{
                 backgroundImage:
                   "linear-gradient(rgba(255,255,255,0.35) 2px, transparent 2px), linear-gradient(90deg, rgba(255,255,255,0.35) 2px, transparent 2px)",
                 backgroundSize: "48px 48px",
               }}
             >
-              {/* sky / grass decorations */}
               <div className="absolute left-8 top-8 text-5xl">☀️</div>
               <div className="absolute right-10 top-8 text-5xl">☁️</div>
               <div className="absolute left-36 top-12 text-4xl">☁️</div>
 
-              {/* paths */}
-              <div className="absolute left-0 top-[265px] h-28 w-full bg-yellow-200 border-y-4 border-yellow-400" />
-              <div className="absolute left-[420px] top-0 h-full w-28 bg-yellow-200 border-x-4 border-yellow-400" />
+              <div className="absolute left-0 top-[265px] h-28 w-full border-y-4 border-yellow-400 bg-yellow-200" />
+              <div className="absolute left-[420px] top-0 h-full w-28 border-x-4 border-yellow-400 bg-yellow-200" />
 
-              {/* places */}
-              <div className="absolute left-24 top-130 text-center">
+              <div className="absolute left-24 top-[130px] text-center">
                 <div className="text-6xl">🌲</div>
                 <p className="rounded-full bg-green-700 px-3 py-1 text-sm font-bold text-white">
                   Forest
@@ -139,7 +202,7 @@ export default function Home() {
               </div>
 
               <div className="absolute left-6 bottom-6 rounded-2xl border-4 border-blue-300 bg-white px-4 py-3 text-sm font-bold text-blue-700 shadow-lg">
-                Move: WASD / Arrow Keys
+                Click game first, then move with WASD / Arrow Keys
               </div>
 
               {isNearNpc && (
@@ -148,7 +211,6 @@ export default function Home() {
                 </div>
               )}
 
-              {/* player */}
               <div
                 className="absolute text-center transition-all duration-100"
                 style={{ left: player.x, top: player.y }}
@@ -161,7 +223,6 @@ export default function Home() {
                 </p>
               </div>
 
-              {/* npc */}
               <div
                 className="absolute text-center"
                 style={{ left: npc.x, top: npc.y }}
@@ -175,14 +236,15 @@ export default function Home() {
               </div>
             </div>
 
-            {/* dialogue on same page */}
             <div className="mt-5 rounded-3xl border-4 border-purple-300 bg-purple-100 p-5 shadow-lg">
               <h2 className="text-2xl font-black text-purple-700">
                 Talk to the AI Elder
               </h2>
 
               <div className="mt-3 rounded-2xl border-4 border-white bg-white p-4">
-                <p className="text-sm font-bold text-purple-500">NPC Response</p>
+                <p className="text-sm font-bold text-purple-500">
+                  NPC Response
+                </p>
                 <p className="mt-1 text-lg font-medium">
                   {loading ? "Thinking..." : npcResponse}
                 </p>
@@ -215,7 +277,6 @@ export default function Home() {
             </div>
           </div>
 
-          {/* side metrics */}
           <aside className="rounded-3xl border-4 border-white bg-white/85 p-5 shadow-2xl">
             <h2 className="text-3xl font-black text-blue-700">Metrics</h2>
 
@@ -224,7 +285,10 @@ export default function Home() {
                 <p className="text-sm font-bold text-blue-600">Cache Mode</p>
                 <select
                   value={cacheMode}
-                  onChange={(e) => setCacheMode(e.target.value)}
+                  onChange={(e) => {
+                    setCacheMode(e.target.value);
+                    gameRef.current?.focus();
+                  }}
                   className="mt-2 w-full rounded-xl border-2 border-blue-300 bg-white p-2 font-bold"
                 >
                   <option>KV Cache ON</option>
@@ -233,28 +297,38 @@ export default function Home() {
               </div>
 
               <div className="rounded-2xl border-4 border-green-200 bg-green-100 p-4">
-                <p className="text-sm font-bold text-green-700">Response Latency</p>
+                <p className="text-sm font-bold text-green-700">
+                  Response Latency
+                </p>
                 <p className="text-3xl font-black text-green-800">
                   {latency === null ? "Not measured" : `${latency} ms`}
                 </p>
               </div>
 
               <div className="rounded-2xl border-4 border-yellow-200 bg-yellow-100 p-4">
-                <p className="text-sm font-bold text-yellow-700">Response Speed</p>
+                <p className="text-sm font-bold text-yellow-700">
+                  Response Speed
+                </p>
                 <p className="text-xl font-black text-yellow-800">
-                  {cacheMode === "KV Cache ON" ? "Fast Mode ⚡" : "Slow Mode 🐢"}
+                  {cacheMode === "KV Cache ON"
+                    ? "Fast Mode ⚡"
+                    : "Slow Mode 🐢"}
                 </p>
               </div>
 
               <div className="rounded-2xl border-4 border-pink-200 bg-pink-100 p-4">
                 <p className="text-sm font-bold text-pink-700">Goal</p>
                 <p className="text-sm font-medium">
-                  This demo shows how response speed can change the feel of talking to an AI game character.
+                  This demo shows how response speed can change the feel of
+                  talking to an AI game character.
                 </p>
               </div>
 
               <button
-                onClick={() => setPlayer({ x: 110, y: 330 })}
+                onClick={() => {
+                  setPlayer({ x: 110, y: 330 });
+                  gameRef.current?.focus();
+                }}
                 className="w-full rounded-2xl border-4 border-white bg-orange-400 px-5 py-3 font-black text-white shadow-lg hover:bg-orange-300"
               >
                 Reset Player
