@@ -17,7 +17,7 @@ add_executable(kv_backend
 )
 
 target_include_directories(kv_backend PRIVATE
-    ../include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
     ../third_party/llama.cpp/include
     ../third_party/llama.cpp/ggml/include
 )
