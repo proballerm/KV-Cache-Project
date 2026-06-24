@@ -1,27 +1,32 @@
-#include <chrono>
-#include <cctype>
+#include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <string>
-#include <thread>
 
 #include "httplib.h"
 #include "json.hpp"
+#include "llama_runner.h"
 
 using json = nlohmann::json;
 
-std::string to_lower(std::string text) {
-    for (char& c : text) {
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    return text;
-}
-
 int main() {
+    const char* model_env = std::getenv("MODEL_PATH");
+
+    if (!model_env) {
+        std::cerr << "ERROR: MODEL_PATH is not set\n";
+        return 1;
+    }
+
+    std::string model_path = model_env;
+
+    std::cout << "Loading llama.cpp model...\n";
+    LlamaRunner runner(model_path, 999);
+    std::cout << "Model loaded successfully\n";
+
     httplib::Server app;
 
     app.Options(".*", [](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_header("Access-Control-Allow-Credentials", "true");
         res.set_header("Access-Control-Allow-Methods", "*");
         res.set_header("Access-Control-Allow-Headers", "*");
         res.status = 204;
@@ -31,70 +36,47 @@ int main() {
         res.set_header("Access-Control-Allow-Origin", "*");
 
         json response = {
-            {"status", "Backend is running"}
+            {"status", "Backend is running"},
+            {"backend", "embedded llama.cpp"}
         };
 
         res.set_content(response.dump(), "application/json");
     });
 
-    app.Post("/chat", [](const httplib::Request& req, httplib::Response& res) {
-        auto start_time = std::chrono::high_resolution_clock::now();
-
+    app.Post("/chat", [&runner](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_header("Access-Control-Allow-Credentials", "true");
         res.set_header("Access-Control-Allow-Methods", "*");
         res.set_header("Access-Control-Allow-Headers", "*");
 
-        json request = json::parse(req.body);
+        try {
+            json request = json::parse(req.body);
 
-        std::string message = request.value("message", "");
-        bool use_cache = request.value("use_cache", false);
+            std::string message = request.value("message", "");
+            bool use_cache = request.value("use_cache", true);
 
-        if (use_cache) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1800));
+            LlamaResult result = runner.generate(message, 80);
+
+            json response = {
+                {"response", result.response},
+                {"latency_ms", result.latency_ms},
+                {"tokens_per_second", result.tokens_per_second},
+                {"generated_tokens", result.generated_tokens},
+                {"use_cache", use_cache},
+                {"backend", "embedded llama.cpp"}
+            };
+
+            res.set_content(response.dump(), "application/json");
+        } catch (const std::exception& e) {
+            json error = {
+                {"error", e.what()}
+            };
+
+            res.status = 500;
+            res.set_content(error.dump(), "application/json");
         }
-
-        std::string user_message = to_lower(message);
-        std::string npc_response;
-
-        if (user_message.find("dragon") != std::string::npos) {
-            npc_response =
-                "The dragon guards the cave because it protects an ancient crystal that powers the entire valley.";
-        } else if (user_message.find("cave") != std::string::npos) {
-            npc_response =
-                "The cave is old and filled with glowing stones. Many travelers enter, but not all return.";
-        } else if (user_message.find("castle") != std::string::npos) {
-            npc_response =
-                "The castle gates are closed because strange lights appeared near the mountain last night.";
-        } else if (user_message.find("treasure") != std::string::npos) {
-            npc_response =
-                "The real treasure is not gold. It is a memory stone that stores the forgotten history of this world.";
-        } else {
-            npc_response =
-                "That is a great question. This world has many secrets, and your choices will shape what happens next.";
-        }
-
-        auto end_time = std::chrono::high_resolution_clock::now();
-
-        int latency_ms = static_cast<int>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                end_time - start_time
-            ).count()
-        );
-
-        json response = {
-            {"response", npc_response},
-            {"latency_ms", latency_ms},
-            {"tokens_per_second", use_cache ? 55 : 15},
-            {"use_cache", use_cache}
-        };
-
-        res.set_content(response.dump(), "application/json");
     });
 
-    std::cout << "Backend is running on http://localhost:8000" << std::endl;
+    std::cout << "Backend running on http://localhost:8000\n";
     app.listen("0.0.0.0", 8000);
 
     return 0;
