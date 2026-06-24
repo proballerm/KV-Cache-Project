@@ -1,3 +1,0 @@
-C:/Users/praba/kv-cache-project/backend/build/CMakeFiles/kv_backend.dir
-C:/Users/praba/kv-cache-project/backend/build/CMakeFiles/edit_cache.dir
-C:/Users/praba/kv-cache-project/backend/build/CMakeFiles/rebuild_cache.dir
