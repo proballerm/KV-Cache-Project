@@ -2,313 +2,159 @@
 
 import { useEffect, useRef, useState } from "react";
 
-type Team = "cache" | "nocache";
+type Mode = "gpu" | "cpu";
 
-type Bot = {
+type Result = {
   id: number;
-  team: Team;
-  name: string;
-  emoji: string;
-  role: string;
-  x: number;
-  y: number;
-  targetX: number;
-  targetY: number;
-  goalIndex: number;
-  goalsCompleted: number;
-  actionsTaken: number;
-  latencyTotal: number;
-  lastLatency: number | null;
-  tokensPerSecond: number | null;
-  thought: string;
-  isThinking: boolean;
-};
-
-type LogEntry = {
-  id: number;
-  team: Team;
-  text: string;
+  mode: Mode;
+  round: number;
   latency: number;
+  tps: number;
+  response: string;
+  contextTokens: number;
 };
 
 const backendUrl =
   process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
 
-const locations = [
-  { name: "Village", x: 210, y: 270, emoji: "🏘️" },
-  { name: "Forest", x: 95, y: 135, emoji: "🌲" },
-  { name: "Castle", x: 675, y: 120, emoji: "🏰" },
-  { name: "Cave", x: 420, y: 420, emoji: "🕳️" },
-  { name: "Crystal", x: 705, y: 420, emoji: "💎" },
-];
+const basePrompt = `
+You are an AI NPC in a fantasy game.
+The player is exploring a village, forest, castle, cave, and crystal chamber.
+A dragon guards the cave because it protects an ancient crystal.
+`;
 
-const goalPath = ["Village", "Forest", "Castle", "Cave", "Crystal", "Village"];
-
-const startingBots: Bot[] = [
-  {
-    id: 1,
-    team: "cache",
-    name: "Blue Wizard",
-    emoji: "🧙‍♂️",
-    role: "KV Cache ON",
-    x: 120,
-    y: 250,
-    targetX: 210,
-    targetY: 270,
-    goalIndex: 0,
-    goalsCompleted: 0,
-    actionsTaken: 0,
-    latencyTotal: 0,
-    lastLatency: null,
-    tokensPerSecond: null,
-    thought: "Ready to complete objectives with KV Cache.",
-    isThinking: false,
-  },
-  {
-    id: 2,
-    team: "cache",
-    name: "Blue Guard",
-    emoji: "🛡️",
-    role: "KV Cache ON",
-    x: 120,
-    y: 330,
-    targetX: 210,
-    targetY: 270,
-    goalIndex: 0,
-    goalsCompleted: 0,
-    actionsTaken: 0,
-    latencyTotal: 0,
-    lastLatency: null,
-    tokensPerSecond: null,
-    thought: "Ready to patrol quickly.",
-    isThinking: false,
-  },
-  {
-    id: 3,
-    team: "nocache",
-    name: "Red Wizard",
-    emoji: "🧙‍♀️",
-    role: "KV Cache OFF",
-    x: 820,
-    y: 250,
-    targetX: 210,
-    targetY: 270,
-    goalIndex: 0,
-    goalsCompleted: 0,
-    actionsTaken: 0,
-    latencyTotal: 0,
-    lastLatency: null,
-    tokensPerSecond: null,
-    thought: "Ready, but every thought is slower without cache.",
-    isThinking: false,
-  },
-  {
-    id: 4,
-    team: "nocache",
-    name: "Red Guard",
-    emoji: "🛡️",
-    role: "KV Cache OFF",
-    x: 820,
-    y: 330,
-    targetX: 210,
-    targetY: 270,
-    goalIndex: 0,
-    goalsCompleted: 0,
-    actionsTaken: 0,
-    latencyTotal: 0,
-    lastLatency: null,
-    tokensPerSecond: null,
-    thought: "Ready, but no KV cache means slower decisions.",
-    isThinking: false,
-  },
+const tasks = [
+  "Explain why the dragon guards the cave.",
+  "Explain how the crystal powers the village.",
+  "Explain what the player should do next.",
+  "Explain why the castle gates are locked.",
+  "Explain how the forest connects to the cave.",
+  "Explain the danger near the treasure.",
+  "Explain how the NPC guides the player.",
+  "Explain the secret history of the crystal.",
 ];
 
 export default function Home() {
-  const [bots, setBots] = useState<Bot[]>(startingBots);
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [running, setRunning] = useState(false);
-  const [secondsLeft, setSecondsLeft] = useState(60);
   const [backendStatus, setBackendStatus] = useState("Not checked");
+  const [running, setRunning] = useState(false);
+  const [round, setRound] = useState(0);
+  const [secondsLeft, setSecondsLeft] = useState(60);
+  const [logs, setLogs] = useState<Result[]>([]);
+  const [gpuThinking, setGpuThinking] = useState(false);
+  const [cpuThinking, setCpuThinking] = useState(false);
 
-  const movementRef = useRef<NodeJS.Timeout | null>(null);
+  const runningRef = useRef(false);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
 
   async function checkBackend() {
     try {
-      const response = await fetch(`${backendUrl}/`);
-      const data = await response.json();
+      const res = await fetch(`${backendUrl}/`);
+      const data = await res.json();
       setBackendStatus(data.status || "Backend connected");
     } catch {
       setBackendStatus("Backend not connected");
     }
   }
 
-  function getLocation(name: string) {
-    return locations.find((location) => location.name === name) || locations[0];
+  function buildPrompt(currentRound: number) {
+    const history = Array.from({ length: currentRound + 1 })
+      .map((_, i) => `Round ${i + 1}: ${tasks[i % tasks.length]}`)
+      .join("\n");
+
+    return `${basePrompt}
+
+Conversation history:
+${history}
+
+Answer the latest task in one short sentence.`;
   }
 
-  function getTeamStats(team: Team) {
-    const teamBots = bots.filter((bot) => bot.team === team);
+  async function runInference(mode: Mode, currentRound: number) {
+    if (mode === "gpu") setGpuThinking(true);
+    else setCpuThinking(true);
 
-    const goals = teamBots.reduce((sum, bot) => sum + bot.goalsCompleted, 0);
-    const actions = teamBots.reduce((sum, bot) => sum + bot.actionsTaken, 0);
-    const latencyTotal = teamBots.reduce(
-      (sum, bot) => sum + bot.latencyTotal,
-      0
-    );
-
-    const avgLatency = actions === 0 ? null : Math.round(latencyTotal / actions);
-
-    const avgTpsValues = teamBots
-      .map((bot) => bot.tokensPerSecond)
-      .filter((value): value is number => value !== null);
-
-    const avgTps =
-      avgTpsValues.length === 0
-        ? null
-        : Math.round(
-            avgTpsValues.reduce((sum, value) => sum + value, 0) /
-              avgTpsValues.length
-          );
-
-    return { goals, actions, avgLatency, avgTps };
-  }
-
-  async function completeBotDecision(bot: Bot) {
-    const currentGoal = goalPath[bot.goalIndex];
-    const nextGoal = goalPath[(bot.goalIndex + 1) % goalPath.length];
-
-    const message =
-      `${bot.name} is trying to finish objectives in an AI village race. ` +
-      `Current location: ${currentGoal}. Next objective: ${nextGoal}. ` +
-      `Team mode: ${bot.role}. Explain the bot's next action briefly. ` +
-      `Mention dragon, cave, castle, treasure, or crystal if useful.`;
-
-    setBots((prev) =>
-      prev.map((item) =>
-        item.id === bot.id ? { ...item, isThinking: true } : item
-      )
-    );
+    const prompt = buildPrompt(currentRound);
 
     try {
-      const response = await fetch(`${backendUrl}/chat`, {
+      const res = await fetch(`${backendUrl}/chat`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          message,
-          use_cache: bot.team === "cache",
+          message: prompt,
+          use_cache: mode === "gpu",
         }),
       });
 
-      const data = await response.json();
+      const data = await res.json();
 
-      const newGoalIndex = (bot.goalIndex + 1) % goalPath.length;
-      const newTarget = getLocation(goalPath[newGoalIndex]);
-      const completedFullLoop = newGoalIndex === 0;
+      const result: Result = {
+        id: Date.now() + Math.random(),
+        mode,
+        round: currentRound + 1,
+        latency: Math.round(data.latency_ms),
+        tps: Math.round(data.tokens_per_second),
+        response: data.response,
+        contextTokens: Math.round(prompt.length / 4),
+      };
 
-      setBots((prev) =>
-        prev.map((item) =>
-          item.id === bot.id
-            ? {
-                ...item,
-                goalIndex: newGoalIndex,
-                targetX: newTarget.x,
-                targetY: newTarget.y,
-                goalsCompleted: completedFullLoop
-                  ? item.goalsCompleted + 1
-                  : item.goalsCompleted,
-                actionsTaken: item.actionsTaken + 1,
-                latencyTotal: item.latencyTotal + data.latency_ms,
-                lastLatency: data.latency_ms,
-                tokensPerSecond: data.tokens_per_second,
-                thought: data.response,
-                isThinking: false,
-              }
-            : item
-        )
-      );
-
+      setLogs((prev) => [result, ...prev.slice(0, 23)]);
+    } catch {
       setLogs((prev) => [
         {
           id: Date.now() + Math.random(),
-          team: bot.team,
-          text: `${bot.name} reached ${currentGoal} → heading to ${nextGoal}. ${data.response}`,
-          latency: data.latency_ms,
+          mode,
+          round: currentRound + 1,
+          latency: 0,
+          tps: 0,
+          response: "Backend request failed.",
+          contextTokens: 0,
         },
-        ...prev.slice(0, 14),
+        ...prev.slice(0, 23),
       ]);
-    } catch {
-      setBots((prev) =>
-        prev.map((item) =>
-          item.id === bot.id
-            ? {
-                ...item,
-                thought: "Backend request failed.",
-                isThinking: false,
-              }
-            : item
-        )
-      );
+    }
+
+    if (mode === "gpu") setGpuThinking(false);
+    else setCpuThinking(false);
+  }
+
+  async function loop() {
+    let currentRound = 0;
+
+    while (runningRef.current) {
+      setRound(currentRound + 1);
+
+      await Promise.all([
+        runInference("gpu", currentRound),
+        runInference("cpu", currentRound),
+      ]);
+
+      currentRound++;
     }
   }
 
-  function updateMovement() {
-    setBots((prevBots) => {
-      const updatedBots = prevBots.map((bot) => {
-        const dx = bot.targetX - bot.x;
-        const dy = bot.targetY - bot.y;
-        const distance = Math.sqrt(dx * dx + dy * dy);
-
-        if (distance < 8 && !bot.isThinking) {
-          completeBotDecision(bot);
-          return bot;
-        }
-
-        if (distance < 8) return bot;
-
-        const speed = bot.team === "cache" ? 0.075 : 0.045;
-
-        return {
-          ...bot,
-          x: bot.x + dx * speed,
-          y: bot.y + dy * speed,
-        };
-      });
-
-      return updatedBots;
-    });
-  }
-
-  function startRace() {
+  function start() {
     if (running) return;
 
     setRunning(true);
-
-    movementRef.current = setInterval(() => {
-      updateMovement();
-    }, 100);
+    runningRef.current = true;
+    setSecondsLeft(60);
 
     timerRef.current = setInterval(() => {
       setSecondsLeft((prev) => {
         if (prev <= 1) {
-          stopRace();
+          stop();
           return 0;
         }
-
         return prev - 1;
       });
     }, 1000);
+
+    loop();
   }
 
-  function stopRace() {
+  function stop() {
     setRunning(false);
-
-    if (movementRef.current) {
-      clearInterval(movementRef.current);
-      movementRef.current = null;
-    }
+    runningRef.current = false;
 
     if (timerRef.current) {
       clearInterval(timerRef.current);
@@ -316,167 +162,173 @@ export default function Home() {
     }
   }
 
-  function resetRace() {
-    stopRace();
-    setBots(startingBots);
-    setLogs([]);
+  function reset() {
+    stop();
+    setRound(0);
     setSecondsLeft(60);
+    setLogs([]);
   }
 
   useEffect(() => {
     checkBackend();
-
-    return () => {
-      if (movementRef.current) clearInterval(movementRef.current);
-      if (timerRef.current) clearInterval(timerRef.current);
-    };
+    return () => stop();
   }, []);
 
-  const cacheStats = getTeamStats("cache");
-  const noCacheStats = getTeamStats("nocache");
+  const gpuLogs = logs.filter((l) => l.mode === "gpu");
+  const cpuLogs = logs.filter((l) => l.mode === "cpu");
 
-  let winner = "Race in progress";
-  if (secondsLeft === 0 || !running) {
-    if (cacheStats.goals > noCacheStats.goals) winner = "🏆 KV Cache ON wins";
-    else if (noCacheStats.goals > cacheStats.goals)
-      winner = "🏆 KV Cache OFF wins";
-    else if (cacheStats.actions > noCacheStats.actions)
-      winner = "🏆 KV Cache ON leads by actions";
-    else if (noCacheStats.actions > cacheStats.actions)
-      winner = "🏆 KV Cache OFF leads by actions";
-    else winner = "Tie so far";
-  }
+  const avg = (arr: number[]) =>
+    arr.length === 0
+      ? null
+      : Math.round(arr.reduce((a, b) => a + b, 0) / arr.length);
+
+  const gpuAvgLatency = avg(gpuLogs.map((l) => l.latency));
+  const cpuAvgLatency = avg(cpuLogs.map((l) => l.latency));
+  const gpuAvgTps = avg(gpuLogs.map((l) => l.tps));
+  const cpuAvgTps = avg(cpuLogs.map((l) => l.tps));
+
+  const latest = logs[0];
+  const contextTokens = latest?.contextTokens || 0;
+
+  const speedup =
+    gpuAvgLatency && cpuAvgLatency && gpuAvgLatency > 0
+      ? (cpuAvgLatency / gpuAvgLatency).toFixed(2)
+      : "N/A";
 
   return (
-    <main className="min-h-screen bg-gradient-to-b from-sky-300 via-cyan-100 to-lime-100 p-8 text-slate-900">
-      <div className="mx-auto max-w-7xl">
-        <div className="mb-6 rounded-3xl border-4 border-white bg-white/85 p-6 shadow-xl">
-          <p className="text-sm font-bold uppercase tracking-[0.25em] text-purple-600">
-            Version 3 Demo
+    <main className="min-h-screen overflow-y-auto bg-slate-950 p-4 text-white">
+      <div className="mx-auto max-w-[1600px] space-y-3">
+        <header className="rounded-2xl border border-cyan-500/40 bg-slate-900 p-4">
+          <p className="text-xs font-bold uppercase tracking-[0.3em] text-cyan-400">
+            KV Cache Performance Lab
           </p>
 
-          <h1 className="text-5xl font-black text-blue-700">
-            CacheQuest: AI Agent Race
+          <h1 className="text-3xl font-black">
+            Transformer Inference Control Room
           </h1>
 
-          <p className="mt-2 text-lg font-medium text-slate-700">
-            Two AI teams race to complete objectives. Blue agents use KV Cache.
-            Red agents do not. Lower inference latency means faster decisions
-            and more completed goals.
+          <p className="mt-1 text-sm text-slate-300">
+            Same GPU, same model, two modes: GPU KV Cache vs CPU KV Cache.
           </p>
-        </div>
 
-        <section className="grid grid-cols-1 gap-6 xl:grid-cols-[1fr_390px]">
-          <div className="rounded-3xl border-4 border-white bg-white/80 p-5 shadow-2xl">
-            <div
-              className="relative h-[640px] overflow-hidden rounded-3xl border-4 border-green-500 bg-green-300"
-              style={{
-                backgroundImage:
-                  "linear-gradient(rgba(255,255,255,0.35) 2px, transparent 2px), linear-gradient(90deg, rgba(255,255,255,0.35) 2px, transparent 2px)",
-                backgroundSize: "48px 48px",
-              }}
-            >
-              <div className="absolute left-8 top-8 text-5xl">☀️</div>
-              <div className="absolute right-10 top-8 text-5xl">☁️</div>
-              <div className="absolute left-36 top-12 text-4xl">☁️</div>
+          <div className="mt-4 grid grid-cols-2 gap-2 md:grid-cols-4">
+            <Metric label="Backend" value={backendStatus} />
+            <Metric label="Round" value={round.toString()} />
+            <Metric label="Time" value={`${secondsLeft}s`} />
+            <Metric label="Speedup" value={`${speedup}x`} />
+          </div>
+        </header>
 
-              <div className="absolute left-0 top-[300px] h-28 w-full border-y-4 border-yellow-400 bg-yellow-200" />
-              <div className="absolute left-[440px] top-0 h-full w-28 border-x-4 border-yellow-400 bg-yellow-200" />
+        <section className="grid grid-cols-1 gap-3 xl:grid-cols-[1fr_1.1fr_1fr]">
+          <Panel
+            title="🔵 GPU KV Cache"
+            subtitle="KV tensors use the GPU fast path."
+            thinking={gpuThinking}
+            score={gpuLogs.length}
+            latency={gpuAvgLatency}
+            tps={gpuAvgTps}
+            color="blue"
+          />
 
-              {locations.map((location) => (
-                <div
-                  key={location.name}
-                  className="absolute text-center"
-                  style={{ left: location.x, top: location.y }}
+          <div className="space-y-3">
+            <div className="rounded-2xl border border-slate-700 bg-slate-900 p-4">
+              <div className="grid grid-cols-3 gap-3">
+                <button
+                  onClick={start}
+                  disabled={running}
+                  className="rounded-xl bg-green-500 px-4 py-3 font-black hover:bg-green-400 disabled:bg-slate-600"
                 >
-                  <div className="text-6xl">{location.emoji}</div>
-                  <p className="rounded-full bg-slate-800 px-3 py-1 text-sm font-bold text-white">
-                    {location.name}
-                  </p>
-                </div>
-              ))}
+                  Start
+                </button>
 
-              {bots.map((bot) => (
-                <div
-                  key={bot.id}
-                  className="absolute text-center transition-all duration-100"
-                  style={{ left: bot.x, top: bot.y }}
+                <button
+                  onClick={stop}
+                  disabled={!running}
+                  className="rounded-xl bg-red-500 px-4 py-3 font-black hover:bg-red-400 disabled:bg-slate-600"
                 >
-                  <div
-                    className={`flex h-20 w-20 items-center justify-center rounded-full border-4 border-white text-5xl shadow-xl ${
-                      bot.team === "cache" ? "bg-blue-500" : "bg-red-500"
-                    }`}
-                  >
-                    {bot.emoji}
-                  </div>
+                  Stop
+                </button>
 
-                  <p
-                    className={`mt-1 rounded-full px-3 py-1 text-xs font-bold text-white ${
-                      bot.team === "cache" ? "bg-blue-700" : "bg-red-700"
-                    }`}
-                  >
-                    {bot.name}
-                  </p>
-
-                  {bot.isThinking && (
-                    <p className="mt-1 animate-pulse rounded-full bg-yellow-300 px-2 py-1 text-xs font-black text-yellow-900">
-                      Thinking...
-                    </p>
-                  )}
-                </div>
-              ))}
-
-              <div className="absolute bottom-5 left-5 rounded-2xl border-4 border-white bg-blue-100 p-4 shadow-xl">
-                <p className="text-lg font-black text-blue-700">
-                  🔵 KV Cache ON
-                </p>
-                <p className="text-sm font-bold">
-                  Faster decisions, more actions
-                </p>
+                <button
+                  onClick={reset}
+                  className="rounded-xl bg-orange-500 px-4 py-3 font-black hover:bg-orange-400"
+                >
+                  Reset
+                </button>
               </div>
 
-              <div className="absolute bottom-5 right-5 rounded-2xl border-4 border-white bg-red-100 p-4 shadow-xl">
-                <p className="text-lg font-black text-red-700">
-                  🔴 KV Cache OFF
-                </p>
-                <p className="text-sm font-bold">
-                  Slower decisions, fewer actions
-                </p>
+              <div className="mt-3 rounded-xl border border-purple-500 bg-purple-950/50 p-3 text-sm text-slate-300">
+                Lower latency means more answers completed in the same time.
+                Growing context makes KV placement matter more.
               </div>
             </div>
 
-            <div className="mt-5 rounded-3xl border-4 border-purple-300 bg-purple-100 p-5 shadow-lg">
-              <h2 className="text-2xl font-black text-purple-700">
-                AI Decision Log
-              </h2>
+            <div className="rounded-2xl border border-slate-700 bg-slate-900 p-4">
+              <h2 className="text-xl font-black">Live Performance Graphs</h2>
 
-              <div className="mt-3 max-h-72 space-y-3 overflow-y-auto rounded-2xl border-4 border-white bg-white p-4">
+              <div className="mt-3 space-y-3">
+                <BarGraph
+                  title="Latency"
+                  leftLabel="GPU"
+                  rightLabel="CPU"
+                  leftValue={gpuAvgLatency}
+                  rightValue={cpuAvgLatency}
+                  unit="ms"
+                  lowerIsBetter
+                />
+
+                <BarGraph
+                  title="Tokens/sec"
+                  leftLabel="GPU"
+                  rightLabel="CPU"
+                  leftValue={gpuAvgTps}
+                  rightValue={cpuAvgTps}
+                  unit="tok/s"
+                />
+
+                <SingleBar
+                  title="Context Length"
+                  value={contextTokens}
+                  max={3000}
+                  unit="tokens"
+                />
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-slate-700 bg-slate-900 p-4">
+              <h2 className="text-xl font-black">Live Inference Log</h2>
+
+              <div className="mt-3 max-h-[360px] space-y-2 overflow-y-auto pr-1">
                 {logs.length === 0 ? (
-                  <p className="font-medium text-slate-500">
-                    Start the race to watch autonomous agents make decisions.
+                  <p className="text-sm text-slate-400">
+                    Start the benchmark to collect live llama.cpp results.
                   </p>
                 ) : (
                   logs.map((log) => (
                     <div
                       key={log.id}
-                      className={`rounded-xl border-2 p-3 ${
-                        log.team === "cache"
-                          ? "border-blue-200 bg-blue-50"
-                          : "border-red-200 bg-red-50"
+                      className={`rounded-xl border p-3 ${
+                        log.mode === "gpu"
+                          ? "border-blue-500 bg-blue-950/40"
+                          : "border-red-500 bg-red-950/40"
                       }`}
                     >
-                      <p className="text-sm font-medium">{log.text}</p>
-                      <p
-                        className={`mt-1 text-xs font-bold ${
-                          log.team === "cache"
-                            ? "text-blue-700"
-                            : "text-red-700"
-                        }`}
-                      >
-                        {log.team === "cache"
-                          ? "KV Cache ON"
-                          : "KV Cache OFF"}{" "}
-                        · {log.latency} ms
+                      <div className="flex flex-wrap justify-between gap-2">
+                        <p className="text-sm font-black">
+                          {log.mode === "gpu"
+                            ? "🔵 GPU KV Cache"
+                            : "🔴 CPU KV Cache"}{" "}
+                          · Round {log.round}
+                        </p>
+
+                        <p className="text-xs font-bold text-slate-300">
+                          ~{log.contextTokens} tokens · {log.latency} ms ·{" "}
+                          {log.tps} tok/s
+                        </p>
+                      </div>
+
+                      <p className="mt-1 line-clamp-2 text-xs text-slate-300">
+                        {log.response}
                       </p>
                     </div>
                   ))
@@ -485,121 +337,210 @@ export default function Home() {
             </div>
           </div>
 
-          <aside className="rounded-3xl border-4 border-white bg-white/85 p-5 shadow-2xl">
-            <h2 className="text-3xl font-black text-blue-700">Race Metrics</h2>
-
-            <div className="mt-5 space-y-4">
-              <div className="rounded-2xl border-4 border-blue-200 bg-blue-100 p-4">
-                <p className="text-sm font-bold text-blue-600">Backend</p>
-                <p className="text-lg font-black text-blue-800">
-                  {backendStatus}
-                </p>
-              </div>
-
-              <div className="rounded-2xl border-4 border-yellow-300 bg-yellow-100 p-4 text-center">
-                <p className="text-sm font-bold text-yellow-700">
-                  Time Remaining
-                </p>
-                <p className="text-5xl font-black text-yellow-800">
-                  {secondsLeft}s
-                </p>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <button
-                  onClick={startRace}
-                  disabled={running}
-                  className="rounded-2xl border-4 border-white bg-green-500 px-4 py-3 font-black text-white shadow-lg hover:bg-green-400 disabled:bg-slate-400"
-                >
-                  Start
-                </button>
-
-                <button
-                  onClick={stopRace}
-                  disabled={!running}
-                  className="rounded-2xl border-4 border-white bg-red-500 px-4 py-3 font-black text-white shadow-lg hover:bg-red-400 disabled:bg-slate-400"
-                >
-                  Stop
-                </button>
-              </div>
-
-              <button
-                onClick={resetRace}
-                className="w-full rounded-2xl border-4 border-white bg-orange-400 px-5 py-3 font-black text-white shadow-lg hover:bg-orange-300"
-              >
-                Reset Race
-              </button>
-
-              <div className="rounded-2xl border-4 border-purple-300 bg-purple-100 p-4 text-center">
-                <p className="text-sm font-bold text-purple-700">Winner</p>
-                <p className="text-2xl font-black text-purple-900">{winner}</p>
-              </div>
-
-              <div className="rounded-2xl border-4 border-blue-300 bg-blue-100 p-4">
-                <h3 className="text-xl font-black text-blue-700">
-                  🔵 KV Cache ON
-                </h3>
-                <p className="mt-2 font-bold">
-                  Goals Completed: {cacheStats.goals}
-                </p>
-                <p className="font-bold">Actions Taken: {cacheStats.actions}</p>
-                <p className="font-bold">
-                  Avg Latency:{" "}
-                  {cacheStats.avgLatency === null
-                    ? "N/A"
-                    : `${cacheStats.avgLatency} ms`}
-                </p>
-                <p className="font-bold">
-                  Avg Tokens/sec:{" "}
-                  {cacheStats.avgTps === null ? "N/A" : cacheStats.avgTps}
-                </p>
-              </div>
-
-              <div className="rounded-2xl border-4 border-red-300 bg-red-100 p-4">
-                <h3 className="text-xl font-black text-red-700">
-                  🔴 KV Cache OFF
-                </h3>
-                <p className="mt-2 font-bold">
-                  Goals Completed: {noCacheStats.goals}
-                </p>
-                <p className="font-bold">
-                  Actions Taken: {noCacheStats.actions}
-                </p>
-                <p className="font-bold">
-                  Avg Latency:{" "}
-                  {noCacheStats.avgLatency === null
-                    ? "N/A"
-                    : `${noCacheStats.avgLatency} ms`}
-                </p>
-                <p className="font-bold">
-                  Avg Tokens/sec:{" "}
-                  {noCacheStats.avgTps === null ? "N/A" : noCacheStats.avgTps}
-                </p>
-              </div>
-
-              <div className="rounded-2xl border-4 border-pink-200 bg-pink-100 p-4">
-                <p className="text-sm font-bold text-pink-700">
-                  Demo Explanation
-                </p>
-                <p className="text-sm font-medium">
-                  Every objective requires an AI backend call. KV Cache ON has
-                  lower simulated inference latency, so those agents can make
-                  decisions faster and complete more work in the same time.
-                </p>
-              </div>
-
-              <div className="rounded-2xl border-4 border-slate-200 bg-slate-100 p-4">
-                <p className="text-sm font-bold text-slate-700">
-                  Objective Path
-                </p>
-                <p className="text-sm font-medium">
-                  Village → Forest → Castle → Cave → Crystal → Village
-                </p>
-              </div>
-            </div>
-          </aside>
+          <Panel
+            title="🔴 CPU KV Cache"
+            subtitle="KV tensors are not offloaded to GPU."
+            thinking={cpuThinking}
+            score={cpuLogs.length}
+            latency={cpuAvgLatency}
+            tps={cpuAvgTps}
+            color="red"
+          />
         </section>
       </div>
     </main>
+  );
+}
+
+function Metric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-xl border border-slate-700 bg-slate-950/60 p-3 text-center">
+      <p className="text-xs font-bold text-slate-400">{label}</p>
+      <p className="mt-1 text-sm font-black text-cyan-300">{value}</p>
+    </div>
+  );
+}
+
+function Panel({
+  title,
+  subtitle,
+  thinking,
+  score,
+  latency,
+  tps,
+  color,
+}: {
+  title: string;
+  subtitle: string;
+  thinking: boolean;
+  score: number;
+  latency: number | null;
+  tps: number | null;
+  color: "blue" | "red";
+}) {
+  const colorClasses =
+    color === "blue"
+      ? "border-blue-500 bg-blue-950/50 text-blue-300"
+      : "border-red-500 bg-red-950/50 text-red-300";
+
+  return (
+    <div className={`rounded-2xl border p-5 ${colorClasses}`}>
+      <h2 className="text-2xl font-black">{title}</h2>
+      <p className="mt-1 text-sm text-slate-300">{subtitle}</p>
+
+      <div className="mt-6 text-center">
+        <p className="text-sm font-bold text-slate-300">Answers Completed</p>
+        <p className="text-8xl font-black">{score}</p>
+      </div>
+
+      <div className="mt-6 rounded-2xl bg-slate-950/50 p-4 text-white">
+        <p>Status: {thinking ? "Thinking..." : "Ready"}</p>
+        <p>Avg Latency: {latency ?? "N/A"} ms</p>
+        <p>Avg Tokens/sec: {tps ?? "N/A"}</p>
+      </div>
+
+      <div className="mt-5">
+        <p className="mb-2 text-sm font-bold text-slate-300">
+          Decode Activity
+        </p>
+        <div className="h-5 overflow-hidden rounded-full bg-slate-800">
+          <div
+            className={`h-full transition-all ${
+              color === "blue" ? "bg-blue-300" : "bg-red-300"
+            } ${thinking ? "animate-pulse" : ""}`}
+            style={{ width: thinking ? "100%" : "18%" }}
+          />
+        </div>
+      </div>
+
+      <div className="mt-6 rounded-xl border border-cyan-500/30 bg-cyan-950/20 p-4 text-sm text-slate-300">
+        <p className="font-bold text-cyan-300">Transformer Path</p>
+
+        <div className="mt-3 grid grid-cols-3 items-center gap-2 text-center text-xs">
+          <div className="rounded-lg bg-slate-900 p-2">Prompt</div>
+          <div>→</div>
+          <div className="rounded-lg bg-slate-900 p-2">KV Cache</div>
+          <div className="col-span-3">↓</div>
+          <div className="col-span-3 rounded-lg bg-slate-900 p-2">
+            Decode next token
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BarGraph({
+  title,
+  leftLabel,
+  rightLabel,
+  leftValue,
+  rightValue,
+  unit,
+  lowerIsBetter = false,
+}: {
+  title: string;
+  leftLabel: string;
+  rightLabel: string;
+  leftValue: number | null;
+  rightValue: number | null;
+  unit: string;
+  lowerIsBetter?: boolean;
+}) {
+  const left = leftValue ?? 0;
+  const right = rightValue ?? 0;
+  const max = Math.max(left, right, 1);
+
+  const leftWidth = Math.max(4, (left / max) * 100);
+  const rightWidth = Math.max(4, (right / max) * 100);
+
+  return (
+    <div>
+      <div className="mb-1 flex justify-between text-xs font-bold text-slate-400">
+        <span>{title}</span>
+        <span>{lowerIsBetter ? "Lower is better" : "Higher is better"}</span>
+      </div>
+
+      <GraphRow
+        label={leftLabel}
+        value={leftValue}
+        unit={unit}
+        width={leftWidth}
+        color="blue"
+      />
+
+      <GraphRow
+        label={rightLabel}
+        value={rightValue}
+        unit={unit}
+        width={rightWidth}
+        color="red"
+      />
+    </div>
+  );
+}
+
+function GraphRow({
+  label,
+  value,
+  unit,
+  width,
+  color,
+}: {
+  label: string;
+  value: number | null;
+  unit: string;
+  width: number;
+  color: "blue" | "red";
+}) {
+  return (
+    <div className="mb-1 grid grid-cols-[42px_1fr_90px] items-center gap-2">
+      <p className="text-xs font-bold text-slate-300">{label}</p>
+
+      <div className="h-4 overflow-hidden rounded-full bg-slate-800">
+        <div
+          className={`h-full rounded-full ${
+            color === "blue" ? "bg-blue-400" : "bg-red-400"
+          }`}
+          style={{ width: `${width}%` }}
+        />
+      </div>
+
+      <p className="text-right text-xs font-bold text-slate-300">
+        {value === null ? "N/A" : `${value} ${unit}`}
+      </p>
+    </div>
+  );
+}
+
+function SingleBar({
+  title,
+  value,
+  max,
+  unit,
+}: {
+  title: string;
+  value: number;
+  max: number;
+  unit: string;
+}) {
+  const width = Math.min(100, Math.max(4, (value / max) * 100));
+
+  return (
+    <div>
+      <div className="mb-1 flex justify-between text-xs font-bold text-slate-400">
+        <span>{title}</span>
+        <span>
+          {value} {unit}
+        </span>
+      </div>
+
+      <div className="h-4 overflow-hidden rounded-full bg-slate-800">
+        <div
+          className="h-full rounded-full bg-cyan-400"
+          style={{ width: `${width}%` }}
+        />
+      </div>
+    </div>
   );
 }

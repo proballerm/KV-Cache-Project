@@ -16,7 +16,11 @@ public:
     LlamaRunner(const std::string& model_path, int n_gpu_layers = 999);
     ~LlamaRunner();
 
-    LlamaResult generate(const std::string& user_message, int max_tokens = 80);
+    LlamaResult generate(
+        const std::string& user_message,
+        bool use_cache,
+        int max_tokens = 80
+    );
 
 private:
     struct Impl;

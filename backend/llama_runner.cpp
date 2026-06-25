@@ -37,7 +37,11 @@ LlamaRunner::~LlamaRunner() {
     }
 }
 
-LlamaResult LlamaRunner::generate(const std::string& user_message, int max_tokens) {
+LlamaResult LlamaRunner::generate(
+    const std::string& user_message,
+    bool use_cache,
+    int max_tokens
+) {
     std::lock_guard<std::mutex> lock(mutex);
 
     std::string prompt =
@@ -74,6 +78,10 @@ LlamaResult LlamaRunner::generate(const std::string& user_message, int max_token
     ctx_params.n_ctx = n_prompt + max_tokens;
     ctx_params.n_batch = n_prompt;
     ctx_params.no_perf = false;
+
+    // true  = GPU KV Cache / KQV offload enabled
+    // false = CPU KV Cache / KQV offload disabled
+    ctx_params.offload_kqv = use_cache;
 
     llama_context* ctx = llama_init_from_model(impl->model, ctx_params);
 

@@ -37,7 +37,8 @@ int main() {
 
         json response = {
             {"status", "Backend is running"},
-            {"backend", "embedded llama.cpp"}
+            {"backend", "embedded llama.cpp"},
+            {"modes", "GPU KV Cache vs CPU KV Cache"}
         };
 
         res.set_content(response.dump(), "application/json");
@@ -54,7 +55,11 @@ int main() {
             std::string message = request.value("message", "");
             bool use_cache = request.value("use_cache", true);
 
-            LlamaResult result = runner.generate(message, 80);
+            LlamaResult result = runner.generate(message, use_cache, 80);
+
+            std::string mode = use_cache
+                ? "GPU KV Cache"
+                : "CPU KV Cache";
 
             json response = {
                 {"response", result.response},
@@ -62,6 +67,7 @@ int main() {
                 {"tokens_per_second", result.tokens_per_second},
                 {"generated_tokens", result.generated_tokens},
                 {"use_cache", use_cache},
+                {"mode", mode},
                 {"backend", "embedded llama.cpp"}
             };
 
