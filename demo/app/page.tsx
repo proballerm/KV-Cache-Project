@@ -1,7 +1,9 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
+  Bar,
+  BarChart,
   CartesianGrid,
   Legend,
   Line,
@@ -12,852 +14,1511 @@ import {
   YAxis,
 } from "recharts";
 
-type Mode = "gpu" | "cpu";
+type Precision = "F16" | "Q8_0" | "Q4_0";
+type QualityPriority =
+  | "maximum_quality"
+  | "balanced"
+  | "maximum_capacity";
 
-type Result = {
-  id: number;
-  mode: Mode;
-  round: number;
-  latency: number;
-  tps: number;
-  response: string;
-  contextTokens: number;
+type SystemInfo = {
+  backend?: string;
+  device?: string;
+  model_description?: string;
+  model_layers?: number;
+  attention_heads?: number;
+  key_value_heads?: number;
+  head_dimension?: number;
+  model_size_bytes?: number;
+  device_memory?: {
+    free_bytes?: number;
+    total_bytes?: number;
+    used_bytes?: number;
+  };
+  supported_kv_precisions?: string[];
+};
+
+type CacheConfiguration = {
+  key_precision?: Precision;
+  value_precision?: Precision;
+  precision_name?: string;
+  estimated_cache_bytes?: number;
+  estimated_cache_megabytes?: number;
+  fits_available_vram?: boolean;
+  used_fallback?: boolean;
+  reason?: string;
+};
+
+type MemoryResult = {
+  before_context_bytes?: number;
+  after_context_bytes?: number;
+  context_allocation_delta_bytes?: number;
+};
+
+type InferenceResult = {
+  response?: string;
+  backend?: string;
+  device?: string;
+  mode?: string;
+  configuration?: CacheConfiguration;
+  offload_kqv?: boolean;
+  flash_attention?: boolean;
+  context_tokens?: number;
+  generated_tokens?: number;
+  prefill_ms?: number;
+  decode_ms?: number;
+  latency_ms?: number;
+  time_to_first_token_ms?: number;
+  tokens_per_second?: number;
+  memory?: MemoryResult;
+  error?: string;
+};
+
+type BenchmarkRow = {
+  target_context_tokens: number;
+  actual_context_tokens: number;
+  generated_tokens: number;
+
+  key_precision: Precision;
+  value_precision: Precision;
+
+  estimated_cache_bytes: number;
+
+  memory_before_context_bytes: number;
+  memory_after_context_bytes: number;
+  context_allocation_delta_bytes: number;
+
+  prefill_ms: number;
+  decode_ms: number;
+  total_latency_ms: number;
+  time_to_first_token_ms: number;
+
+  decode_tokens_per_second: number;
+  end_to_end_tokens_per_second: number;
+
+  success: boolean;
+  error: string;
+};
+
+type BenchmarkResponse = {
+  benchmark_type?: string;
+  backend?: string;
+  device?: string;
+  flash_attention?: boolean;
+  max_tokens?: number;
+  results?: BenchmarkRow[];
+  error?: string;
 };
 
 const backendUrl =
   process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
 
-const basePrompt = `
-You are an AI NPC in a fantasy game.
-The player is exploring a village, forest, castle, cave, and crystal chamber.
-A dragon guards the cave because it protects an ancient crystal.
-`;
+const defaultPrompt = `
+The player is exploring a fantasy village near an ancient cave.
+A dragon protects a crystal that powers the village.
+Explain why the dragon guards the crystal and what the player should do next.
+`.trim();
 
-const tasks = [
-  "Explain why the dragon guards the cave.",
-  "Explain how the crystal powers the village.",
-  "Explain what the player should do next.",
-  "Explain why the castle gates are locked.",
-  "Explain how the forest connects to the cave.",
-  "Explain the danger near the treasure.",
-  "Explain how the NPC guides the player.",
-  "Explain the secret history of the crystal.",
-];
+const contextOptions = [1024, 2048, 4096, 8192, 16384];
+
+function formatBytes(bytes?: number) {
+  if (!bytes || bytes <= 0) {
+    return "N/A";
+  }
+
+  const gigabytes = bytes / 1024 ** 3;
+
+  if (gigabytes >= 1) {
+    return `${gigabytes.toFixed(2)} GB`;
+  }
+
+  return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+}
+
+function formatMilliseconds(value?: number) {
+  if (value === undefined || !Number.isFinite(value)) {
+    return "N/A";
+  }
+
+  return `${value.toFixed(1)} ms`;
+}
+
+function formatRate(value?: number) {
+  if (value === undefined || !Number.isFinite(value)) {
+    return "N/A";
+  }
+
+  return `${value.toFixed(1)} tok/s`;
+}
+
+function percentageReduction(
+  baseline?: number,
+  optimized?: number
+): number | null {
+  if (
+    baseline === undefined ||
+    optimized === undefined ||
+    baseline <= 0 ||
+    optimized < 0
+  ) {
+    return null;
+  }
+
+  return ((baseline - optimized) / baseline) * 100;
+}
+
+async function readJson<T>(response: Response): Promise<T> {
+  const data = (await response.json()) as T;
+
+  if (!response.ok) {
+    const possibleError = data as { error?: string };
+
+    throw new Error(
+      possibleError.error ||
+        `Backend request failed with status ${response.status}`
+    );
+  }
+
+  return data;
+}
 
 export default function Home() {
-  const [backendStatus, setBackendStatus] = useState("Not checked");
-  const [running, setRunning] = useState(false);
-  const [round, setRound] = useState(0);
-  const [secondsLeft, setSecondsLeft] = useState(60);
-  const [logs, setLogs] = useState<Result[]>([]);
-  const [gpuThinking, setGpuThinking] = useState(false);
-  const [cpuThinking, setCpuThinking] = useState(false);
+  const [backendStatus, setBackendStatus] =
+    useState("Checking backend...");
 
-  const runningRef = useRef(false);
-  const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const [systemInfo, setSystemInfo] =
+    useState<SystemInfo | null>(null);
 
-  async function checkBackend() {
+  const [prompt, setPrompt] =
+    useState(defaultPrompt);
+
+  const [maxTokens, setMaxTokens] =
+    useState(64);
+
+  const [concurrency, setConcurrency] =
+    useState(1);
+
+  const [qualityPriority, setQualityPriority] =
+    useState<QualityPriority>("balanced");
+
+  const [flashAttention, setFlashAttention] =
+    useState(true);
+
+  const [baselineRunning, setBaselineRunning] =
+    useState(false);
+
+  const [optimizedRunning, setOptimizedRunning] =
+    useState(false);
+
+  const [benchmarkRunning, setBenchmarkRunning] =
+    useState(false);
+
+  const [baseline, setBaseline] =
+    useState<InferenceResult | null>(null);
+
+  const [optimized, setOptimized] =
+    useState<InferenceResult | null>(null);
+
+  const [benchmarkRows, setBenchmarkRows] =
+    useState<BenchmarkRow[]>([]);
+
+  const [selectedContexts, setSelectedContexts] =
+    useState<number[]>([1024, 2048, 4096, 8192]);
+
+  const [error, setError] =
+    useState<string | null>(null);
+
+  async function loadSystemInfo() {
+    setError(null);
+
     try {
-      const res = await fetch(`${backendUrl}/`);
-      const data = await res.json();
-      setBackendStatus(data.status || "Backend connected");
-    } catch {
+      const healthResponse =
+        await fetch(`${backendUrl}/`);
+
+      const health =
+        await readJson<{ status?: string }>(
+          healthResponse
+        );
+
+      setBackendStatus(
+        health.status || "Backend connected"
+      );
+
+      const systemResponse =
+        await fetch(`${backendUrl}/system`);
+
+      const system =
+        await readJson<SystemInfo>(
+          systemResponse
+        );
+
+      setSystemInfo(system);
+    } catch (caughtError) {
+      const message =
+        caughtError instanceof Error
+          ? caughtError.message
+          : "Backend is not connected";
+
       setBackendStatus("Backend not connected");
+      setError(message);
     }
   }
 
-  function buildPrompt(currentRound: number) {
-    const history = Array.from({ length: currentRound + 1 })
-      .map((_, i) => `Round ${i + 1}: ${tasks[i % tasks.length]}`)
-      .join("\n");
-
-    return `${basePrompt}
-
-Conversation history:
-${history}
-
-Answer the latest task in one short sentence.`;
-  }
-
-  async function runInference(mode: Mode, currentRound: number) {
-    if (mode === "gpu") setGpuThinking(true);
-    else setCpuThinking(true);
-
-    const prompt = buildPrompt(currentRound);
+  async function runBaseline() {
+    setBaselineRunning(true);
+    setError(null);
 
     try {
-      const res = await fetch(`${backendUrl}/chat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message: prompt,
-          use_cache: mode === "gpu",
-        }),
-      });
-
-      const data = await res.json();
-
-      const result: Result = {
-        id: Date.now() + Math.random(),
-        mode,
-        round: currentRound + 1,
-        latency: Math.round(data.latency_ms || 0),
-        tps: Math.round(data.tokens_per_second || 0),
-        response: data.response || "No response returned.",
-        contextTokens: Math.round(prompt.length / 4),
-      };
-
-      setLogs((prev) => [result, ...prev.slice(0, 39)]);
-    } catch {
-      setLogs((prev) => [
+      const response = await fetch(
+        `${backendUrl}/chat`,
         {
-          id: Date.now() + Math.random(),
-          mode,
-          round: currentRound + 1,
-          latency: 0,
-          tps: 0,
-          response: "Backend request failed.",
-          contextTokens: 0,
-        },
-        ...prev.slice(0, 39),
-      ]);
-    }
-
-    if (mode === "gpu") setGpuThinking(false);
-    else setCpuThinking(false);
-  }
-
-  async function modeLoop(mode: Mode) {
-    let currentRound = 0;
-
-    while (runningRef.current) {
-      setRound((prev) => Math.max(prev, currentRound + 1));
-      await runInference(mode, currentRound);
-      currentRound++;
-    }
-  }
-
-  function start() {
-    if (running) return;
-
-    setRunning(true);
-    runningRef.current = true;
-    setSecondsLeft(60);
-
-    timerRef.current = setInterval(() => {
-      setSecondsLeft((prev) => {
-        if (prev <= 1) {
-          stop();
-          return 0;
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            message: prompt,
+            mode: "manual",
+            key_precision: "F16",
+            value_precision: "F16",
+            max_tokens: maxTokens,
+            concurrency,
+            offload_kqv: true,
+            flash_attention: flashAttention,
+          }),
         }
-        return prev - 1;
-      });
-    }, 1000);
+      );
 
-    modeLoop("gpu");
-    modeLoop("cpu");
-  }
+      const result =
+        await readJson<InferenceResult>(
+          response
+        );
 
-  function stop() {
-    setRunning(false);
-    runningRef.current = false;
-
-    if (timerRef.current) {
-      clearInterval(timerRef.current);
-      timerRef.current = null;
+      setBaseline(result);
+    } catch (caughtError) {
+      setError(
+        caughtError instanceof Error
+          ? caughtError.message
+          : "Baseline inference failed"
+      );
+    } finally {
+      setBaselineRunning(false);
     }
   }
 
-  function reset() {
-    stop();
-    setRound(0);
-    setSecondsLeft(60);
-    setLogs([]);
+  async function runOptimized() {
+    setOptimizedRunning(true);
+    setError(null);
+
+    try {
+      const response = await fetch(
+        `${backendUrl}/chat`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            message: prompt,
+            mode: "auto",
+            quality_priority: qualityPriority,
+            max_tokens: maxTokens,
+            concurrency,
+            offload_kqv: true,
+            flash_attention: flashAttention,
+          }),
+        }
+      );
+
+      const result =
+        await readJson<InferenceResult>(
+          response
+        );
+
+      setOptimized(result);
+    } catch (caughtError) {
+      setError(
+        caughtError instanceof Error
+          ? caughtError.message
+          : "Optimized inference failed"
+      );
+    } finally {
+      setOptimizedRunning(false);
+    }
+  }
+
+  async function runComparison() {
+    setBaseline(null);
+    setOptimized(null);
+    setError(null);
+
+    await runBaseline();
+    await runOptimized();
+  }
+
+  async function runBenchmark() {
+    setBenchmarkRunning(true);
+    setError(null);
+    setBenchmarkRows([]);
+
+    try {
+      const response = await fetch(
+        `${backendUrl}/benchmark`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            context_lengths: selectedContexts,
+            max_tokens: maxTokens,
+            flash_attention: flashAttention,
+            precisions: [
+              "F16",
+              "Q8_0",
+              "Q4_0",
+            ],
+          }),
+        }
+      );
+
+      const data =
+        await readJson<BenchmarkResponse>(
+          response
+        );
+
+      setBenchmarkRows(
+        data.results || []
+      );
+    } catch (caughtError) {
+      setError(
+        caughtError instanceof Error
+          ? caughtError.message
+          : "Benchmark failed"
+      );
+    } finally {
+      setBenchmarkRunning(false);
+    }
+  }
+
+  function toggleContext(context: number) {
+    setSelectedContexts((current) => {
+      if (current.includes(context)) {
+        if (current.length === 1) {
+          return current;
+        }
+
+        return current.filter(
+          (value) => value !== context
+        );
+      }
+
+      return [...current, context].sort(
+        (left, right) => left - right
+      );
+    });
+  }
+
+  function resetResults() {
+    setBaseline(null);
+    setOptimized(null);
+    setBenchmarkRows([]);
+    setError(null);
   }
 
   useEffect(() => {
-    checkBackend();
-    return () => stop();
+    loadSystemInfo();
   }, []);
 
-  const successfulLogs = logs.filter((l) => l.latency > 0 && l.tps > 0);
-  const gpuLogs = successfulLogs.filter((l) => l.mode === "gpu");
-  const cpuLogs = successfulLogs.filter((l) => l.mode === "cpu");
+  const baselineEstimated =
+    baseline?.configuration
+      ?.estimated_cache_bytes;
 
-  const avg = (arr: number[]) =>
-    arr.length === 0
-      ? null
-      : Math.round(arr.reduce((a, b) => a + b, 0) / arr.length);
+  const optimizedEstimated =
+    optimized?.configuration
+      ?.estimated_cache_bytes;
 
-  const sum = (arr: number[]) => arr.reduce((a, b) => a + b, 0);
+  const estimatedMemoryReduction =
+    percentageReduction(
+      baselineEstimated,
+      optimizedEstimated
+    );
 
-  const gpuAvgLatency = avg(gpuLogs.map((l) => l.latency));
-  const cpuAvgLatency = avg(cpuLogs.map((l) => l.latency));
-  const gpuAvgTps = avg(gpuLogs.map((l) => l.tps));
-  const cpuAvgTps = avg(cpuLogs.map((l) => l.tps));
+  const baselineMeasured =
+    baseline?.memory
+      ?.context_allocation_delta_bytes;
 
-  const gpuLast = gpuLogs[0];
-  const cpuLast = cpuLogs[0];
+  const optimizedMeasured =
+    optimized?.memory
+      ?.context_allocation_delta_bytes;
 
-  const gpuTotalLatency = sum(gpuLogs.map((l) => l.latency));
-  const cpuTotalLatency = sum(cpuLogs.map((l) => l.latency));
+  const measuredMemoryReduction =
+    percentageReduction(
+      baselineMeasured,
+      optimizedMeasured
+    );
 
-  const gpuTotalTokensApprox = sum(
-    gpuLogs.map((l) => Math.round((l.tps * l.latency) / 1000))
+  const latencyChange =
+    baseline?.latency_ms &&
+    optimized?.latency_ms
+      ? ((optimized.latency_ms -
+          baseline.latency_ms) /
+          baseline.latency_ms) *
+        100
+      : null;
+
+  const throughputChange =
+    baseline?.tokens_per_second &&
+    optimized?.tokens_per_second
+      ? ((optimized.tokens_per_second -
+          baseline.tokens_per_second) /
+          baseline.tokens_per_second) *
+        100
+      : null;
+
+  const comparisonChart = useMemo(
+    () => [
+      {
+        metric: "Estimated KV MB",
+        baseline:
+          (baselineEstimated || 0) /
+          1024 ** 2,
+        optimized:
+          (optimizedEstimated || 0) /
+          1024 ** 2,
+      },
+      {
+        metric: "Measured Delta MB",
+        baseline:
+          (baselineMeasured || 0) /
+          1024 ** 2,
+        optimized:
+          (optimizedMeasured || 0) /
+          1024 ** 2,
+      },
+    ],
+    [
+      baselineEstimated,
+      optimizedEstimated,
+      baselineMeasured,
+      optimizedMeasured,
+    ]
   );
-  const cpuTotalTokensApprox = sum(
-    cpuLogs.map((l) => Math.round((l.tps * l.latency) / 1000))
-  );
 
-  const latest = successfulLogs[0];
-  const contextTokens = latest?.contextTokens || 0;
+  const benchmarkChart = useMemo(() => {
+    const grouped = new Map<
+      number,
+      Record<string, number | null>
+    >();
 
-  const speedup =
-    gpuAvgLatency && cpuAvgLatency && gpuAvgLatency > 0
-      ? (cpuAvgLatency / gpuAvgLatency).toFixed(2)
-      : "N/A";
+    for (const row of benchmarkRows) {
+      if (!row.success) {
+        continue;
+      }
 
-  const maxCompleted = Math.max(gpuLogs.length, cpuLogs.length, 1);
-  const gpuCompletedWidth = Math.max(6, (gpuLogs.length / maxCompleted) * 100);
-  const cpuCompletedWidth = Math.max(6, (cpuLogs.length / maxCompleted) * 100);
+      const current =
+        grouped.get(
+          row.target_context_tokens
+        ) || {
+          context:
+            row.target_context_tokens,
+          F16: null,
+          Q8_0: null,
+          Q4_0: null,
+        };
 
-  const chartData = Array.from({
-    length: Math.max(gpuLogs.length, cpuLogs.length),
-  }).map((_, index) => {
-    const gpu = gpuLogs[gpuLogs.length - 1 - index];
-    const cpu = cpuLogs[cpuLogs.length - 1 - index];
+      current[row.key_precision] =
+        row.decode_tokens_per_second;
 
-    return {
-      round: index + 1,
-      gpuLatency: gpu?.latency ?? null,
-      cpuLatency: cpu?.latency ?? null,
-      gpuTps: gpu?.tps ?? null,
-      cpuTps: cpu?.tps ?? null,
-    };
-  });
+      grouped.set(
+        row.target_context_tokens,
+        current
+      );
+    }
+
+    return Array.from(
+      grouped.values()
+    ).sort(
+      (left, right) =>
+        Number(left.context) -
+        Number(right.context)
+    );
+  }, [benchmarkRows]);
+
+  const memoryBenchmarkChart = useMemo(() => {
+    return benchmarkRows
+      .filter((row) => row.success)
+      .map((row) => ({
+        context:
+          row.target_context_tokens,
+        precision:
+          row.key_precision,
+        label:
+          `${row.target_context_tokens / 1024}K ${row.key_precision}`,
+        estimatedMB:
+          row.estimated_cache_bytes /
+          1024 ** 2,
+        measuredMB:
+          row.context_allocation_delta_bytes /
+          1024 ** 2,
+      }));
+  }, [benchmarkRows]);
+
+  const totalMemory =
+    systemInfo?.device_memory
+      ?.total_bytes;
+
+  const freeMemory =
+    systemInfo?.device_memory
+      ?.free_bytes;
+
+  const deviceMemoryUsage =
+    totalMemory && freeMemory
+      ? ((totalMemory - freeMemory) /
+          totalMemory) *
+        100
+      : null;
 
   return (
-    <main className="min-h-screen bg-slate-950 p-3 text-white">
-      <div className="mx-auto max-w-[1700px] space-y-2">
-        <header className="rounded-2xl border border-cyan-500/40 bg-slate-900 p-3">
-          <div className="flex items-center justify-between gap-4">
+    <main className="min-h-screen bg-slate-950 px-4 py-5 text-white">
+      <div className="mx-auto max-w-[1700px] space-y-4">
+        <header className="rounded-2xl border border-cyan-500/40 bg-slate-900 p-5">
+          <div className="flex flex-col justify-between gap-5 xl:flex-row xl:items-center">
             <div>
-              <p className="text-xs font-bold uppercase tracking-[0.25em] text-cyan-400">
-                KV Cache Performance Lab
+              <p className="text-xs font-bold uppercase tracking-[0.28em] text-cyan-400">
+                AMD MI300X · ROCm · llama.cpp
               </p>
-              <h1 className="text-3xl font-black">
-                Transformer Inference Control Room
+
+              <h1 className="mt-1 text-3xl font-black md:text-4xl">
+                Adaptive KV-Cache Optimization Lab
               </h1>
-              <p className="text-sm text-slate-300">
-                Same GPU, same model, two modes: GPU KV Cache vs CPU KV Cache.
+
+              <p className="mt-2 max-w-3xl text-sm text-slate-300">
+                Compare an F16 KV-cache baseline
+                against a memory-aware optimizer that
+                selects Q8_0, Q4_0, or mixed
+                key/value precision for real
+                llama.cpp inference.
               </p>
             </div>
 
-            <div className="grid min-w-[680px] grid-cols-4 gap-2">
-              <Metric label="Backend" value={backendStatus} />
-              <Metric label="Round" value={round.toString()} />
-              <Metric label="Time" value={`${secondsLeft}s`} />
-              <Metric label="Speedup" value={`${speedup}x`} />
+            <div className="grid grid-cols-2 gap-2 md:grid-cols-4 xl:min-w-[760px]">
+              <Metric
+                label="Backend"
+                value={
+                  systemInfo?.backend ||
+                  backendStatus
+                }
+              />
+
+              <Metric
+                label="Device"
+                value={
+                  systemInfo?.device ||
+                  "Unknown"
+                }
+              />
+
+              <Metric
+                label="HBM / VRAM"
+                value={
+                  totalMemory
+                    ? formatBytes(totalMemory)
+                    : "N/A"
+                }
+              />
+
+              <Metric
+                label="Memory Used"
+                value={
+                  deviceMemoryUsage === null
+                    ? "N/A"
+                    : `${deviceMemoryUsage.toFixed(1)}%`
+                }
+              />
             </div>
           </div>
         </header>
 
-        <section className="grid grid-cols-1 gap-2 xl:grid-cols-[0.85fr_1.35fr_0.85fr]">
-          <Panel
-            title="🔵 GPU KV Cache"
-            subtitle="KV tensors use the GPU fast path."
-            thinking={gpuThinking}
-            score={gpuLogs.length}
-            latency={gpuAvgLatency}
-            tps={gpuAvgTps}
-            lastLatency={gpuLast?.latency ?? null}
-            lastTps={gpuLast?.tps ?? null}
-            totalLatency={gpuTotalLatency}
-            totalTokens={gpuTotalTokensApprox}
-            color="blue"
-          />
+        {error && (
+          <div className="rounded-xl border border-red-500 bg-red-950/50 p-3 text-sm text-red-200">
+            {error}
+          </div>
+        )}
 
-          <div className="space-y-2">
-            <div className="rounded-2xl border border-slate-700 bg-slate-900 p-3">
-              <div className="grid grid-cols-3 gap-2">
+        <section className="grid grid-cols-1 gap-4 xl:grid-cols-[360px_1fr]">
+          <aside className="space-y-4">
+            <div className="rounded-2xl border border-slate-700 bg-slate-900 p-4">
+              <h2 className="text-xl font-black">
+                Experiment Controls
+              </h2>
+
+              <label className="mt-4 block text-sm font-bold text-slate-300">
+                Prompt
+              </label>
+
+              <textarea
+                value={prompt}
+                onChange={(event) =>
+                  setPrompt(
+                    event.target.value
+                  )
+                }
+                rows={7}
+                className="mt-1 w-full rounded-xl border border-slate-600 bg-slate-950 p-3 text-sm outline-none focus:border-cyan-400"
+              />
+
+              <label className="mt-4 block text-sm font-bold text-slate-300">
+                Maximum generated tokens
+              </label>
+
+              <input
+                type="number"
+                min={1}
+                max={512}
+                value={maxTokens}
+                onChange={(event) =>
+                  setMaxTokens(
+                    Math.max(
+                      1,
+                      Number(
+                        event.target.value
+                      )
+                    )
+                  )
+                }
+                className="mt-1 w-full rounded-xl border border-slate-600 bg-slate-950 px-3 py-2"
+              />
+
+              <label className="mt-4 block text-sm font-bold text-slate-300">
+                Capacity concurrency
+              </label>
+
+              <input
+                type="number"
+                min={1}
+                max={64}
+                value={concurrency}
+                onChange={(event) =>
+                  setConcurrency(
+                    Math.max(
+                      1,
+                      Number(
+                        event.target.value
+                      )
+                    )
+                  )
+                }
+                className="mt-1 w-full rounded-xl border border-slate-600 bg-slate-950 px-3 py-2"
+              />
+
+              <p className="mt-1 text-xs text-slate-400">
+                Values above one currently represent
+                estimated KV capacity unless the backend
+                executes multiple sequences concurrently.
+              </p>
+
+              <label className="mt-4 block text-sm font-bold text-slate-300">
+                Optimizer priority
+              </label>
+
+              <select
+                value={qualityPriority}
+                onChange={(event) =>
+                  setQualityPriority(
+                    event.target
+                      .value as QualityPriority
+                  )
+                }
+                className="mt-1 w-full rounded-xl border border-slate-600 bg-slate-950 px-3 py-2"
+              >
+                <option value="maximum_quality">
+                  Maximum quality
+                </option>
+
+                <option value="balanced">
+                  Balanced
+                </option>
+
+                <option value="maximum_capacity">
+                  Maximum capacity
+                </option>
+              </select>
+
+              <label className="mt-4 flex items-center justify-between rounded-xl border border-slate-700 bg-slate-950/60 p-3">
+                <span>
+                  <span className="block text-sm font-bold">
+                    Flash Attention
+                  </span>
+
+                  <span className="text-xs text-slate-400">
+                    Apply the same setting to both
+                    comparison runs.
+                  </span>
+                </span>
+
+                <input
+                  type="checkbox"
+                  checked={flashAttention}
+                  onChange={(event) =>
+                    setFlashAttention(
+                      event.target.checked
+                    )
+                  }
+                  className="h-5 w-5"
+                />
+              </label>
+
+              <div className="mt-4 grid grid-cols-2 gap-2">
                 <button
-                  onClick={start}
-                  disabled={running}
-                  className="rounded-xl bg-green-500 px-4 py-2 font-black hover:bg-green-400 disabled:bg-slate-600"
+                  type="button"
+                  onClick={runComparison}
+                  disabled={
+                    baselineRunning ||
+                    optimizedRunning ||
+                    !prompt.trim()
+                  }
+                  className="rounded-xl bg-cyan-500 px-3 py-2 font-black text-slate-950 hover:bg-cyan-400 disabled:bg-slate-600 disabled:text-slate-300"
                 >
-                  Start
+                  {baselineRunning ||
+                  optimizedRunning
+                    ? "Running..."
+                    : "Run Comparison"}
                 </button>
 
                 <button
-                  onClick={stop}
-                  disabled={!running}
-                  className="rounded-xl bg-red-500 px-4 py-2 font-black hover:bg-red-400 disabled:bg-slate-600"
-                >
-                  Stop
-                </button>
-
-                <button
-                  onClick={reset}
-                  className="rounded-xl bg-orange-500 px-4 py-2 font-black hover:bg-orange-400"
+                  type="button"
+                  onClick={resetResults}
+                  className="rounded-xl bg-orange-500 px-3 py-2 font-black hover:bg-orange-400"
                 >
                   Reset
                 </button>
               </div>
-
-              <div className="mt-2 rounded-xl border border-purple-500 bg-purple-950/50 p-2 text-sm text-slate-300">
-                Progress bars tell the story. Line graphs prove the measured
-                trend.
-              </div>
             </div>
 
-            <PerformanceRace
-              gpuCompleted={gpuLogs.length}
-              cpuCompleted={cpuLogs.length}
-              gpuCompletedWidth={gpuCompletedWidth}
-              cpuCompletedWidth={cpuCompletedWidth}
-              gpuAvgLatency={gpuAvgLatency}
-              cpuAvgLatency={cpuAvgLatency}
-              gpuAvgTps={gpuAvgTps}
-              cpuAvgTps={cpuAvgTps}
-              gpuLast={gpuLast}
-              cpuLast={cpuLast}
-              gpuTotalLatency={gpuTotalLatency}
-              cpuTotalLatency={cpuTotalLatency}
-              gpuTotalTokens={gpuTotalTokensApprox}
-              cpuTotalTokens={cpuTotalTokensApprox}
-              contextTokens={contextTokens}
-              speedup={speedup}
-            />
+            <div className="rounded-2xl border border-slate-700 bg-slate-900 p-4">
+              <h2 className="text-lg font-black">
+                Loaded Model
+              </h2>
 
-            <div className="rounded-2xl border border-slate-700 bg-slate-900 p-3">
-              <h2 className="text-xl font-black">Live Graphs</h2>
+              <div className="mt-3 space-y-2 text-sm">
+                <InfoRow
+                  label="Description"
+                  value={
+                    systemInfo?.model_description ||
+                    "N/A"
+                  }
+                />
 
-              <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
-                <div className="h-48 rounded-xl bg-slate-950/60 p-2">
-                  <p className="mb-1 text-xs font-bold text-slate-300">
-                    Latency Over Time
-                  </p>
+                <InfoRow
+                  label="Model size"
+                  value={formatBytes(
+                    systemInfo?.model_size_bytes
+                  )}
+                />
 
-                  <ResponsiveContainer width="100%" height="88%">
-                    <LineChart data={chartData}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                      <XAxis dataKey="round" stroke="#94a3b8" />
-                      <YAxis stroke="#94a3b8" />
-                      <Tooltip />
-                      <Legend />
-                      <Line
-                        type="monotone"
-                        dataKey="gpuLatency"
-                        name="GPU"
-                        stroke="#60a5fa"
-                        strokeWidth={3}
-                        dot={false}
-                        connectNulls
-                      />
-                      <Line
-                        type="monotone"
-                        dataKey="cpuLatency"
-                        name="CPU"
-                        stroke="#fb7185"
-                        strokeWidth={3}
-                        dot={false}
-                        connectNulls
-                      />
-                    </LineChart>
-                  </ResponsiveContainer>
-                </div>
+                <InfoRow
+                  label="Layers"
+                  value={
+                    systemInfo?.model_layers?.toString() ||
+                    "N/A"
+                  }
+                />
 
-                <div className="h-48 rounded-xl bg-slate-950/60 p-2">
-                  <p className="mb-1 text-xs font-bold text-slate-300">
-                    Tokens/sec Over Time
-                  </p>
+                <InfoRow
+                  label="Attention heads"
+                  value={
+                    systemInfo?.attention_heads?.toString() ||
+                    "N/A"
+                  }
+                />
 
-                  <ResponsiveContainer width="100%" height="88%">
-                    <LineChart data={chartData}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                      <XAxis dataKey="round" stroke="#94a3b8" />
-                      <YAxis stroke="#94a3b8" />
-                      <Tooltip />
-                      <Legend />
-                      <Line
-                        type="monotone"
-                        dataKey="gpuTps"
-                        name="GPU"
-                        stroke="#38bdf8"
-                        strokeWidth={3}
-                        dot={false}
-                        connectNulls
-                      />
-                      <Line
-                        type="monotone"
-                        dataKey="cpuTps"
-                        name="CPU"
-                        stroke="#f43f5e"
-                        strokeWidth={3}
-                        dot={false}
-                        connectNulls
-                      />
-                    </LineChart>
-                  </ResponsiveContainer>
-                </div>
+                <InfoRow
+                  label="KV heads"
+                  value={
+                    systemInfo?.key_value_heads?.toString() ||
+                    "N/A"
+                  }
+                />
+
+                <InfoRow
+                  label="Head dimension"
+                  value={
+                    systemInfo?.head_dimension?.toString() ||
+                    "N/A"
+                  }
+                />
+
+                <InfoRow
+                  label="Free device memory"
+                  value={formatBytes(
+                    freeMemory
+                  )}
+                />
               </div>
+
+              <button
+                type="button"
+                onClick={loadSystemInfo}
+                className="mt-4 w-full rounded-xl border border-cyan-500 px-3 py-2 text-sm font-black text-cyan-300 hover:bg-cyan-950/40"
+              >
+                Refresh System Data
+              </button>
             </div>
+          </aside>
 
-            <div className="rounded-2xl border border-slate-700 bg-slate-900 p-3">
-              <div className="flex items-center justify-between">
-                <h2 className="text-xl font-black">Live Inference Log</h2>
-                <p className="text-xs text-slate-400">
-                  Context: ~{contextTokens} tokens
-                </p>
-              </div>
+          <div className="space-y-4">
+            <section className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+              <ResultPanel
+                title="F16 Baseline"
+                subtitle="Manual F16 key and value caches"
+                result={baseline}
+                running={baselineRunning}
+                color="blue"
+              />
 
-              <div className="mt-2 max-h-[150px] space-y-2 overflow-y-auto pr-1">
-                {logs.length === 0 ? (
+              <ResultPanel
+                title="Adaptive Optimizer"
+                subtitle="Precision selected from available memory and quality priority"
+                result={optimized}
+                running={optimizedRunning}
+                color="purple"
+              />
+            </section>
+
+            <section className="rounded-2xl border border-slate-700 bg-slate-900 p-4">
+              <div className="flex flex-col justify-between gap-3 md:flex-row md:items-center">
+                <div>
+                  <h2 className="text-xl font-black">
+                    Optimization Outcome
+                  </h2>
+
                   <p className="text-sm text-slate-400">
-                    Start the benchmark to collect live llama.cpp results.
+                    Estimated KV memory is calculated
+                    from model architecture. Measured
+                    allocation delta may include other
+                    llama.cpp context buffers.
                   </p>
-                ) : (
-                  logs.slice(0, 6).map((log) => (
-                    <div
-                      key={log.id}
-                      className={`rounded-xl border p-2 ${
-                        log.mode === "gpu"
-                          ? "border-blue-500 bg-blue-950/40"
-                          : "border-red-500 bg-red-950/40"
-                      }`}
-                    >
-                      <div className="flex flex-wrap justify-between gap-2">
-                        <p className="text-sm font-black">
-                          {log.mode === "gpu"
-                            ? "🔵 GPU KV Cache"
-                            : "🔴 CPU KV Cache"}{" "}
-                          · Round {log.round}
-                        </p>
+                </div>
 
-                        <p className="text-xs font-bold text-slate-300">
-                          {log.latency} ms · {log.tps} tok/s · ~
-                          {log.contextTokens} ctx
-                        </p>
-                      </div>
-
-                      <p className="mt-1 line-clamp-1 text-xs text-slate-300">
-                        {log.response}
-                      </p>
-                    </div>
-                  ))
-                )}
+                <span className="rounded-full bg-cyan-950 px-4 py-2 text-sm font-black text-cyan-300">
+                  {optimized?.configuration
+                    ?.precision_name ||
+                    "Waiting for optimizer"}
+                </span>
               </div>
+
+              <div className="mt-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
+                <SummaryMetric
+                  label="Estimated Memory Saved"
+                  value={
+                    estimatedMemoryReduction ===
+                    null
+                      ? "N/A"
+                      : `${estimatedMemoryReduction.toFixed(1)}%`
+                  }
+                />
+
+                <SummaryMetric
+                  label="Measured Delta Reduction"
+                  value={
+                    measuredMemoryReduction ===
+                    null
+                      ? "N/A"
+                      : `${measuredMemoryReduction.toFixed(1)}%`
+                  }
+                />
+
+                <SummaryMetric
+                  label="Latency Change"
+                  value={
+                    latencyChange === null
+                      ? "N/A"
+                      : `${latencyChange >= 0 ? "+" : ""}${latencyChange.toFixed(1)}%`
+                  }
+                />
+
+                <SummaryMetric
+                  label="Throughput Change"
+                  value={
+                    throughputChange === null
+                      ? "N/A"
+                      : `${throughputChange >= 0 ? "+" : ""}${throughputChange.toFixed(1)}%`
+                  }
+                />
+              </div>
+
+              <div className="mt-4 h-72">
+                <ResponsiveContainer
+                  width="100%"
+                  height="100%"
+                >
+                  <BarChart
+                    data={comparisonChart}
+                  >
+                    <CartesianGrid
+                      strokeDasharray="3 3"
+                      stroke="#334155"
+                    />
+
+                    <XAxis
+                      dataKey="metric"
+                      stroke="#94a3b8"
+                    />
+
+                    <YAxis
+                      stroke="#94a3b8"
+                      unit=" MB"
+                    />
+
+                    <Tooltip />
+
+                    <Legend />
+
+                    <Bar
+                      dataKey="baseline"
+                      name="F16 Baseline"
+                      fill="#3b82f6"
+                    />
+
+                    <Bar
+                      dataKey="optimized"
+                      name="Adaptive"
+                      fill="#a855f7"
+                    />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section className="rounded-2xl border border-slate-700 bg-slate-900 p-4">
+          <div className="flex flex-col justify-between gap-4 lg:flex-row lg:items-center">
+            <div>
+              <h2 className="text-2xl font-black">
+                KV Precision Benchmark
+              </h2>
+
+              <p className="text-sm text-slate-400">
+                Run real F16, Q8_0, and Q4_0
+                llama.cpp contexts across several
+                context lengths.
+              </p>
             </div>
+
+            <button
+              type="button"
+              onClick={runBenchmark}
+              disabled={
+                benchmarkRunning ||
+                selectedContexts.length === 0
+              }
+              className="rounded-xl bg-green-500 px-5 py-3 font-black text-slate-950 hover:bg-green-400 disabled:bg-slate-600 disabled:text-slate-300"
+            >
+              {benchmarkRunning
+                ? "Benchmark Running..."
+                : "Run Precision Benchmark"}
+            </button>
           </div>
 
-          <Panel
-            title="🔴 CPU KV Cache"
-            subtitle="KV tensors are not offloaded to GPU."
-            thinking={cpuThinking}
-            score={cpuLogs.length}
-            latency={cpuAvgLatency}
-            tps={cpuAvgTps}
-            lastLatency={cpuLast?.latency ?? null}
-            lastTps={cpuLast?.tps ?? null}
-            totalLatency={cpuTotalLatency}
-            totalTokens={cpuTotalTokensApprox}
-            color="red"
-          />
+          <div className="mt-4 flex flex-wrap gap-2">
+            {contextOptions.map(
+              (context) => {
+                const active =
+                  selectedContexts.includes(
+                    context
+                  );
+
+                return (
+                  <button
+                    key={context}
+                    type="button"
+                    onClick={() =>
+                      toggleContext(context)
+                    }
+                    className={`rounded-full border px-4 py-2 text-sm font-bold ${
+                      active
+                        ? "border-cyan-400 bg-cyan-950 text-cyan-300"
+                        : "border-slate-600 bg-slate-950 text-slate-400"
+                    }`}
+                  >
+                    {context / 1024}K
+                  </button>
+                );
+              }
+            )}
+          </div>
+
+          {benchmarkRows.length === 0 ? (
+            <div className="mt-5 rounded-xl border border-dashed border-slate-600 p-8 text-center text-slate-400">
+              No benchmark data yet.
+            </div>
+          ) : (
+            <>
+              <div className="mt-5 grid grid-cols-1 gap-4 xl:grid-cols-2">
+                <ChartPanel title="Decode Throughput by Context">
+                  <ResponsiveContainer
+                    width="100%"
+                    height="100%"
+                  >
+                    <LineChart
+                      data={benchmarkChart}
+                    >
+                      <CartesianGrid
+                        strokeDasharray="3 3"
+                        stroke="#334155"
+                      />
+
+                      <XAxis
+                        dataKey="context"
+                        stroke="#94a3b8"
+                      />
+
+                      <YAxis
+                        stroke="#94a3b8"
+                        unit=" tok/s"
+                      />
+
+                      <Tooltip />
+                      <Legend />
+
+                      <Line
+                        type="monotone"
+                        dataKey="F16"
+                        stroke="#3b82f6"
+                        strokeWidth={3}
+                        connectNulls
+                      />
+
+                      <Line
+                        type="monotone"
+                        dataKey="Q8_0"
+                        stroke="#a855f7"
+                        strokeWidth={3}
+                        connectNulls
+                      />
+
+                      <Line
+                        type="monotone"
+                        dataKey="Q4_0"
+                        stroke="#22c55e"
+                        strokeWidth={3}
+                        connectNulls
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </ChartPanel>
+
+                <ChartPanel title="Estimated vs Measured Memory">
+                  <ResponsiveContainer
+                    width="100%"
+                    height="100%"
+                  >
+                    <BarChart
+                      data={
+                        memoryBenchmarkChart
+                      }
+                    >
+                      <CartesianGrid
+                        strokeDasharray="3 3"
+                        stroke="#334155"
+                      />
+
+                      <XAxis
+                        dataKey="label"
+                        stroke="#94a3b8"
+                      />
+
+                      <YAxis
+                        stroke="#94a3b8"
+                        unit=" MB"
+                      />
+
+                      <Tooltip />
+                      <Legend />
+
+                      <Bar
+                        dataKey="estimatedMB"
+                        name="Estimated KV"
+                        fill="#06b6d4"
+                      />
+
+                      <Bar
+                        dataKey="measuredMB"
+                        name="Measured Allocation Delta"
+                        fill="#f59e0b"
+                      />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </ChartPanel>
+              </div>
+
+              <div className="mt-5 overflow-x-auto">
+                <table className="w-full min-w-[1100px] border-collapse text-sm">
+                  <thead>
+                    <tr className="border-b border-slate-700 text-left text-slate-400">
+                      <th className="p-2">
+                        Context
+                      </th>
+
+                      <th className="p-2">
+                        K / V
+                      </th>
+
+                      <th className="p-2">
+                        Estimated KV
+                      </th>
+
+                      <th className="p-2">
+                        Measured Delta
+                      </th>
+
+                      <th className="p-2">
+                        Prefill
+                      </th>
+
+                      <th className="p-2">
+                        TTFT
+                      </th>
+
+                      <th className="p-2">
+                        Decode TPS
+                      </th>
+
+                      <th className="p-2">
+                        Generated
+                      </th>
+
+                      <th className="p-2">
+                        Status
+                      </th>
+                    </tr>
+                  </thead>
+
+                  <tbody>
+                    {benchmarkRows.map(
+                      (row, index) => (
+                        <tr
+                          key={`${row.target_context_tokens}-${row.key_precision}-${row.value_precision}-${index}`}
+                          className="border-b border-slate-800"
+                        >
+                          <td className="p-2 font-bold">
+                            {
+                              row.actual_context_tokens
+                            }
+                          </td>
+
+                          <td className="p-2">
+                            {row.key_precision} /{" "}
+                            {row.value_precision}
+                          </td>
+
+                          <td className="p-2">
+                            {formatBytes(
+                              row.estimated_cache_bytes
+                            )}
+                          </td>
+
+                          <td className="p-2">
+                            {formatBytes(
+                              row.context_allocation_delta_bytes
+                            )}
+                          </td>
+
+                          <td className="p-2">
+                            {formatMilliseconds(
+                              row.prefill_ms
+                            )}
+                          </td>
+
+                          <td className="p-2">
+                            {formatMilliseconds(
+                              row.time_to_first_token_ms
+                            )}
+                          </td>
+
+                          <td className="p-2">
+                            {formatRate(
+                              row.decode_tokens_per_second
+                            )}
+                          </td>
+
+                          <td className="p-2">
+                            {
+                              row.generated_tokens
+                            }
+                          </td>
+
+                          <td className="p-2">
+                            {row.success ? (
+                              <span className="rounded-full bg-green-950 px-3 py-1 text-xs font-bold text-green-300">
+                                Success
+                              </span>
+                            ) : (
+                              <span
+                                title={
+                                  row.error
+                                }
+                                className="rounded-full bg-red-950 px-3 py-1 text-xs font-bold text-red-300"
+                              >
+                                Failed
+                              </span>
+                            )}
+                          </td>
+                        </tr>
+                      )
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
         </section>
       </div>
     </main>
   );
 }
 
-function Metric({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-xl border border-slate-700 bg-slate-950/60 p-2 text-center">
-      <p className="text-xs font-bold text-slate-400">{label}</p>
-      <p className="mt-1 text-sm font-black text-cyan-300">{value}</p>
-    </div>
-  );
-}
-
-function PerformanceRace({
-  gpuCompleted,
-  cpuCompleted,
-  gpuCompletedWidth,
-  cpuCompletedWidth,
-  gpuAvgLatency,
-  cpuAvgLatency,
-  gpuAvgTps,
-  cpuAvgTps,
-  gpuLast,
-  cpuLast,
-  gpuTotalLatency,
-  cpuTotalLatency,
-  gpuTotalTokens,
-  cpuTotalTokens,
-  contextTokens,
-  speedup,
-}: {
-  gpuCompleted: number;
-  cpuCompleted: number;
-  gpuCompletedWidth: number;
-  cpuCompletedWidth: number;
-  gpuAvgLatency: number | null;
-  cpuAvgLatency: number | null;
-  gpuAvgTps: number | null;
-  cpuAvgTps: number | null;
-  gpuLast: Result | undefined;
-  cpuLast: Result | undefined;
-  gpuTotalLatency: number;
-  cpuTotalLatency: number;
-  gpuTotalTokens: number;
-  cpuTotalTokens: number;
-  contextTokens: number;
-  speedup: string;
-}) {
-  const maxLatency = Math.max(gpuAvgLatency ?? 0, cpuAvgLatency ?? 0, 1);
-  const maxTps = Math.max(gpuAvgTps ?? 0, cpuAvgTps ?? 0, 1);
-
-  return (
-    <div className="rounded-2xl border border-slate-700 bg-slate-900 p-3">
-      <div className="mb-2 flex items-center justify-between">
-        <h2 className="text-xl font-black">Performance Race</h2>
-        <p className="rounded-full bg-cyan-950 px-3 py-1 text-sm font-black text-cyan-300">
-          {speedup}x speedup
-        </p>
-      </div>
-
-      <div className="space-y-2">
-        <RaceBar
-          label="GPU KV Cache"
-          value={gpuCompleted}
-          width={gpuCompletedWidth}
-          color="blue"
-        />
-
-        <RaceBar
-          label="CPU KV Cache"
-          value={cpuCompleted}
-          width={cpuCompletedWidth}
-          color="red"
-        />
-      </div>
-
-      <div className="mt-3 grid grid-cols-2 gap-2">
-        <StatsCard
-          title="GPU"
-          color="blue"
-          completed={gpuCompleted}
-          avgLatency={gpuAvgLatency}
-          avgTps={gpuAvgTps}
-          lastLatency={gpuLast?.latency ?? null}
-          lastTps={gpuLast?.tps ?? null}
-          totalLatency={gpuTotalLatency}
-          totalTokens={gpuTotalTokens}
-        />
-
-        <StatsCard
-          title="CPU"
-          color="red"
-          completed={cpuCompleted}
-          avgLatency={cpuAvgLatency}
-          avgTps={cpuAvgTps}
-          lastLatency={cpuLast?.latency ?? null}
-          lastTps={cpuLast?.tps ?? null}
-          totalLatency={cpuTotalLatency}
-          totalTokens={cpuTotalTokens}
-        />
-      </div>
-
-      <div className="mt-3 grid grid-cols-2 gap-2">
-        <MiniBars
-          title="Latency"
-          leftLabel="GPU"
-          rightLabel="CPU"
-          leftValue={gpuAvgLatency}
-          rightValue={cpuAvgLatency}
-          max={maxLatency}
-          unit="ms"
-          lower
-        />
-
-        <MiniBars
-          title="Tokens/sec"
-          leftLabel="GPU"
-          rightLabel="CPU"
-          leftValue={gpuAvgTps}
-          rightValue={cpuAvgTps}
-          max={maxTps}
-          unit="tok/s"
-        />
-      </div>
-
-      <div className="mt-3 rounded-xl bg-slate-950/60 p-3">
-        <div className="mb-1 flex justify-between text-xs font-bold text-slate-400">
-          <span>Context Length</span>
-          <span>{contextTokens} tokens</span>
-        </div>
-
-        <div className="h-4 overflow-hidden rounded-full bg-slate-800">
-          <div
-            className="h-full rounded-full bg-cyan-400"
-            style={{
-              width: `${Math.min(100, Math.max(4, contextTokens / 30))}%`,
-            }}
-          />
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function RaceBar({
+function Metric({
   label,
   value,
-  width,
-  color,
 }: {
   label: string;
-  value: number;
-  width: number;
-  color: "blue" | "red";
+  value: string;
 }) {
   return (
-    <div>
-      <div className="mb-1 flex justify-between text-sm font-bold">
-        <span>{label}</span>
-        <span>{value} completed</span>
-      </div>
+    <div className="rounded-xl border border-slate-700 bg-slate-950/60 p-3 text-center">
+      <p className="text-xs font-bold text-slate-400">
+        {label}
+      </p>
 
-      <div className="h-7 overflow-hidden rounded-full bg-slate-800">
-        <div
-          className={`flex h-full items-center justify-end rounded-full pr-3 text-sm font-black text-white ${
-            color === "blue" ? "bg-blue-500" : "bg-red-500"
-          }`}
-          style={{ width: `${width}%` }}
-        >
-          {value}
-        </div>
-      </div>
+      <p className="mt-1 line-clamp-2 text-sm font-black text-cyan-300">
+        {value}
+      </p>
     </div>
   );
 }
 
-function StatsCard({
-  title,
-  color,
-  completed,
-  avgLatency,
-  avgTps,
-  lastLatency,
-  lastTps,
-  totalLatency,
-  totalTokens,
+function SummaryMetric({
+  label,
+  value,
 }: {
-  title: string;
-  color: "blue" | "red";
-  completed: number;
-  avgLatency: number | null;
-  avgTps: number | null;
-  lastLatency: number | null;
-  lastTps: number | null;
-  totalLatency: number;
-  totalTokens: number;
-}) {
-  const colorClass = color === "blue" ? "text-blue-300" : "text-red-300";
-
-  return (
-    <div className="rounded-xl bg-slate-950/60 p-3">
-      <p className={`text-sm font-black ${colorClass}`}>{title} Summary</p>
-
-      <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 text-xs">
-        <p className="text-slate-400">Completed</p>
-        <p className="text-right font-bold">{completed}</p>
-
-        <p className="text-slate-400">Avg Latency</p>
-        <p className="text-right font-bold">
-          {avgLatency === null ? "N/A" : `${avgLatency} ms`}
-        </p>
-
-        <p className="text-slate-400">Avg TPS</p>
-        <p className="text-right font-bold">
-          {avgTps === null ? "N/A" : `${avgTps} tok/s`}
-        </p>
-
-        <p className="text-slate-400">Last Latency</p>
-        <p className="text-right font-bold">
-          {lastLatency === null ? "N/A" : `${lastLatency} ms`}
-        </p>
-
-        <p className="text-slate-400">Last TPS</p>
-        <p className="text-right font-bold">
-          {lastTps === null ? "N/A" : `${lastTps} tok/s`}
-        </p>
-
-        <p className="text-slate-400">Total Latency</p>
-        <p className="text-right font-bold">{totalLatency} ms</p>
-
-        <p className="text-slate-400">Approx Tokens</p>
-        <p className="text-right font-bold">{totalTokens}</p>
-      </div>
-    </div>
-  );
-}
-
-function MiniBars({
-  title,
-  leftLabel,
-  rightLabel,
-  leftValue,
-  rightValue,
-  max,
-  unit,
-  lower = false,
-}: {
-  title: string;
-  leftLabel: string;
-  rightLabel: string;
-  leftValue: number | null;
-  rightValue: number | null;
-  max: number;
-  unit: string;
-  lower?: boolean;
+  label: string;
+  value: string;
 }) {
   return (
     <div className="rounded-xl bg-slate-950/60 p-3">
-      <div className="mb-2 flex justify-between text-xs font-bold text-slate-400">
-        <span>{title}</span>
-        <span>{lower ? "Lower is better" : "Higher is better"}</span>
-      </div>
+      <p className="text-xs font-bold text-slate-400">
+        {label}
+      </p>
 
-      <MiniBarRow
-        label={leftLabel}
-        value={leftValue}
-        unit={unit}
-        width={leftValue ? (leftValue / max) * 100 : 4}
-        color="blue"
-      />
-
-      <MiniBarRow
-        label={rightLabel}
-        value={rightValue}
-        unit={unit}
-        width={rightValue ? (rightValue / max) * 100 : 4}
-        color="red"
-      />
+      <p className="mt-1 text-2xl font-black text-cyan-300">
+        {value}
+      </p>
     </div>
   );
 }
 
-function MiniBarRow({
+function InfoRow({
   label,
   value,
-  unit,
-  width,
-  color,
 }: {
   label: string;
-  value: number | null;
-  unit: string;
-  width: number;
-  color: "blue" | "red";
+  value: string;
 }) {
   return (
-    <div className="mb-1 grid grid-cols-[38px_1fr_80px] items-center gap-2 text-xs">
-      <span className={color === "blue" ? "text-blue-300" : "text-red-300"}>
+    <div className="grid grid-cols-[120px_1fr] gap-3 border-b border-slate-800 pb-2">
+      <span className="text-slate-400">
         {label}
       </span>
 
-      <div className="h-3 rounded-full bg-slate-800">
-        <div
-          className={`h-full rounded-full ${
-            color === "blue" ? "bg-blue-500" : "bg-red-500"
-          }`}
-          style={{ width: `${Math.max(4, width)}%` }}
-        />
-      </div>
-
       <span className="text-right font-bold">
-        {value === null ? "N/A" : `${value} ${unit}`}
+        {value}
       </span>
     </div>
   );
 }
 
-function Panel({
+function ResultPanel({
   title,
   subtitle,
-  thinking,
-  score,
-  latency,
-  tps,
-  lastLatency,
-  lastTps,
-  totalLatency,
-  totalTokens,
+  result,
+  running,
   color,
 }: {
   title: string;
   subtitle: string;
-  thinking: boolean;
-  score: number;
-  latency: number | null;
-  tps: number | null;
-  lastLatency: number | null;
-  lastTps: number | null;
-  totalLatency: number;
-  totalTokens: number;
-  color: "blue" | "red";
+  result: InferenceResult | null;
+  running: boolean;
+  color: "blue" | "purple";
 }) {
-  const colorClasses =
+  const borderColor =
     color === "blue"
-      ? "border-blue-500 bg-blue-950/50 text-blue-300"
-      : "border-red-500 bg-red-950/50 text-red-300";
+      ? "border-blue-500"
+      : "border-purple-500";
+
+  const headingColor =
+    color === "blue"
+      ? "text-blue-300"
+      : "text-purple-300";
 
   return (
-    <div className={`rounded-2xl border p-4 ${colorClasses}`}>
-      <h2 className="text-2xl font-black">{title}</h2>
-      <p className="mt-1 text-sm text-slate-300">{subtitle}</p>
+    <div
+      className={`rounded-2xl border ${borderColor} bg-slate-900 p-4`}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h2
+            className={`text-2xl font-black ${headingColor}`}
+          >
+            {title}
+          </h2>
 
-      <div className="mt-5 text-center">
-        <p className="text-sm font-bold text-slate-300">Answers Completed</p>
-        <p className="text-8xl font-black">{score}</p>
+          <p className="text-sm text-slate-400">
+            {subtitle}
+          </p>
+        </div>
+
+        <span className="rounded-full bg-slate-950 px-3 py-1 text-xs font-black">
+          {running
+            ? "Running"
+            : result
+              ? "Complete"
+              : "Ready"}
+        </span>
       </div>
 
-      <div className="mt-5 rounded-2xl bg-slate-950/50 p-4 text-white">
-        <p>Status: {thinking ? "Thinking..." : "Ready"}</p>
-        <p>Avg Latency: {latency ?? "N/A"} ms</p>
-        <p>Avg Tokens/sec: {tps ?? "N/A"}</p>
-        <p>Last Latency: {lastLatency ?? "N/A"} ms</p>
-        <p>Last Tokens/sec: {lastTps ?? "N/A"}</p>
-        <p>Total Latency: {totalLatency} ms</p>
-        <p>Approx Tokens: {totalTokens}</p>
-      </div>
-
-      <div className="mt-5">
-        <p className="mb-2 text-sm font-bold text-slate-300">
-          Decode Activity
+      <div className="mt-4 rounded-xl bg-slate-950/60 p-4">
+        <p className="text-xs font-bold uppercase tracking-wide text-slate-400">
+          Applied KV Configuration
         </p>
-        <div className="h-5 overflow-hidden rounded-full bg-slate-800">
-          <div
-            className={`h-full transition-all ${
-              color === "blue" ? "bg-blue-300" : "bg-red-300"
-            } ${thinking ? "animate-pulse" : ""}`}
-            style={{ width: thinking ? "100%" : "18%" }}
-          />
-        </div>
+
+        <p
+          className={`mt-1 text-3xl font-black ${headingColor}`}
+        >
+          {result?.configuration
+            ?.precision_name || "N/A"}
+        </p>
+
+        <p className="mt-2 text-xs text-slate-400">
+          {result?.configuration?.reason ||
+            "Run inference to select and apply a configuration."}
+        </p>
       </div>
 
-      <div className="mt-5 rounded-xl border border-cyan-500/30 bg-cyan-950/20 p-4 text-sm text-slate-300">
-        <p className="font-bold text-cyan-300">Transformer Path</p>
+      <div className="mt-4 grid grid-cols-2 gap-2">
+        <SmallResult
+          label="Estimated KV"
+          value={formatBytes(
+            result?.configuration
+              ?.estimated_cache_bytes
+          )}
+        />
 
-        <div className="mt-3 grid grid-cols-3 items-center gap-2 text-center text-xs">
-          <div className="rounded-lg bg-slate-900 p-2">Prompt</div>
-          <div>→</div>
-          <div className="rounded-lg bg-slate-900 p-2">KV Cache</div>
-          <div className="col-span-3">↓</div>
-          <div className="col-span-3 rounded-lg bg-slate-900 p-2">
-            Decode next token
-          </div>
-        </div>
+        <SmallResult
+          label="Measured Delta"
+          value={formatBytes(
+            result?.memory
+              ?.context_allocation_delta_bytes
+          )}
+        />
+
+        <SmallResult
+          label="Prefill"
+          value={formatMilliseconds(
+            result?.prefill_ms
+          )}
+        />
+
+        <SmallResult
+          label="TTFT"
+          value={formatMilliseconds(
+            result?.time_to_first_token_ms
+          )}
+        />
+
+        <SmallResult
+          label="Total Latency"
+          value={formatMilliseconds(
+            result?.latency_ms
+          )}
+        />
+
+        <SmallResult
+          label="Decode Throughput"
+          value={formatRate(
+            result?.tokens_per_second
+          )}
+        />
+
+        <SmallResult
+          label="Prompt Tokens"
+          value={
+            result?.context_tokens?.toString() ||
+            "N/A"
+          }
+        />
+
+        <SmallResult
+          label="Generated Tokens"
+          value={
+            result?.generated_tokens?.toString() ||
+            "N/A"
+          }
+        />
+      </div>
+
+      <div className="mt-4 rounded-xl border border-slate-700 bg-slate-950/50 p-3">
+        <p className="text-xs font-bold uppercase tracking-wide text-slate-400">
+          Model Response
+        </p>
+
+        <p className="mt-2 min-h-[72px] text-sm text-slate-200">
+          {running
+            ? "Running llama.cpp inference..."
+            : result?.response ||
+              "No response yet."}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function SmallResult({
+  label,
+  value,
+}: {
+  label: string;
+  value: string;
+}) {
+  return (
+    <div className="rounded-xl bg-slate-950/60 p-3">
+      <p className="text-xs font-bold text-slate-400">
+        {label}
+      </p>
+
+      <p className="mt-1 font-black">
+        {value}
+      </p>
+    </div>
+  );
+}
+
+function ChartPanel({
+  title,
+  children,
+}: {
+  title: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="h-[340px] rounded-xl bg-slate-950/50 p-3">
+      <p className="mb-2 text-sm font-black text-slate-300">
+        {title}
+      </p>
+
+      <div className="h-[290px]">
+        {children}
       </div>
     </div>
   );
